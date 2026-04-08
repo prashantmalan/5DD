@@ -1,0 +1,130 @@
+{
+  "name": "claude-token-optimizer",
+  "displayName": "Claude Token Optimizer",
+  "description": "Background tool to minimize Claude token usage and maximize efficiency",
+  "version": "1.0.0",
+  "publisher": "claude-optimizer",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other", "Machine Learning"],
+  "keywords": ["claude", "anthropic", "token", "optimization", "ai"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeOptimizer.showDashboard",
+        "title": "Claude Optimizer: Show Dashboard"
+      },
+      {
+        "command": "claudeOptimizer.toggle",
+        "title": "Claude Optimizer: Toggle ON/OFF"
+      },
+      {
+        "command": "claudeOptimizer.startProxy",
+        "title": "Claude Optimizer: Start Proxy Server"
+      },
+      {
+        "command": "claudeOptimizer.stopProxy",
+        "title": "Claude Optimizer: Stop Proxy Server"
+      },
+      {
+        "command": "claudeOptimizer.clearCache",
+        "title": "Claude Optimizer: Clear Cache"
+      },
+      {
+        "command": "claudeOptimizer.optimizeSelection",
+        "title": "Claude Optimizer: Optimize Selected Prompt"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Token Optimizer",
+      "properties": {
+        "claudeOptimizer.proxyPort": {
+          "type": "number",
+          "default": 8787,
+          "description": "Local proxy server port (set ANTHROPIC_BASE_URL=http://localhost:8787)"
+        },
+        "claudeOptimizer.enableCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable semantic response caching"
+        },
+        "claudeOptimizer.cacheThreshold": {
+          "type": "number",
+          "default": 0.92,
+          "description": "Similarity threshold for cache hits (0.0 - 1.0)"
+        },
+        "claudeOptimizer.enableModelRouter": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-route simple queries to cheaper models (haiku)"
+        },
+        "claudeOptimizer.enablePromptCompression": {
+          "type": "boolean",
+          "default": true,
+          "description": "Compress prompts to reduce token usage"
+        },
+        "claudeOptimizer.maxContextMessages": {
+          "type": "number",
+          "default": 20,
+          "description": "Max messages to keep in context window before summarizing"
+        },
+        "claudeOptimizer.anthropicApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Your Anthropic API key (or set ANTHROPIC_API_KEY env var)"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claudeOptimizer",
+          "title": "Claude Token Optimizer",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "claudeOptimizer": [
+        {
+          "type": "webview",
+          "id": "claudeOptimizer.statsView",
+          "name": "Token Stats"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "claudeOptimizer.optimizeSelection",
+          "when": "editorHasSelection",
+          "group": "claudeOptimizer"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "lint": "eslint src --ext ts"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6",
+    "node-cache": "^5.1.2",
+    "tiktoken": "^1.0.15",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
