@@ -77,7 +77,13 @@ async function activate(context) {
     await tokenCounter.init();
     const cache = new semanticCache_1.SemanticCache(config.get('cacheThreshold', 0.92));
     const optimizer = new promptOptimizer_1.PromptOptimizer(tokenCounter);
-    const router = new modelRouter_1.ModelRouter(config.get('enableModelRouter', true));
+    const routerConfig = {
+        enabled: config.get('enableModelRouter', true),
+        apiKey: config.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
+        minimumModel: config.get('minimumModel'),
+        allowOpus: config.get('allowOpus', false),
+    };
+    const router = new modelRouter_1.ModelRouter(routerConfig);
     stats = new statsTracker_1.StatsTracker(context);
     // ── Context system ────────────────────────────────────────────────────────
     const logMonitor = new logMonitor_1.LogMonitor();
@@ -151,6 +157,10 @@ async function activate(context) {
     }), vscode.commands.registerCommand('claudeOptimizer.clearCache', () => {
         cache.clear();
         vscode.window.showInformationMessage('Cache cleared.');
+    }), vscode.commands.registerCommand('claudeOptimizer.clearProxyState', () => {
+        cache.clear();
+        stats.clear();
+        vscode.window.showInformationMessage('Proxy state cleared (cache + stats reset).');
     }), vscode.commands.registerCommand('claudeOptimizer.optimizeSelection', async () => {
         const editor = vscode.window.activeTextEditor;
         if (!editor || editor.selection.isEmpty) {

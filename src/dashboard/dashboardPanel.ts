@@ -21,7 +21,7 @@ export class DashboardPanel {
     return new DashboardPanel(context, stats);
   }
 
-  private constructor(context: vscode.ExtensionContext, stats: StatsTracker) {
+  private constructor(_context: vscode.ExtensionContext, stats: StatsTracker) {
     this.panel = vscode.window.createWebviewPanel(
       'claudeOptimizer',
       'Claude Token Optimizer',
@@ -42,6 +42,7 @@ export class DashboardPanel {
     this.disposables.push(
       this.panel.webview.onDidReceiveMessage(msg => {
         if (msg.type === 'clearStats') stats.clear();
+        if (msg.type === 'clearProxyState') vscode.commands.executeCommand('claudeOptimizer.clearProxyState');
       })
     );
 
@@ -132,12 +133,14 @@ export class DashboardPanel {
 </table>
 
 <button onclick="clearStats()">Clear Stats</button>
+<button onclick="clearProxyState()" style="margin-left:8px;background:var(--vscode-statusBarItem-warningBackground)">Clear Proxy State</button>
 
 <script>
 const vscode = acquireVsCodeApi();
 let stats = ${JSON.stringify(s)};
 
 function clearStats() { vscode.postMessage({ type: 'clearStats' }); }
+function clearProxyState() { vscode.postMessage({ type: 'clearProxyState' }); }
 
 function fmt(n) { return n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n); }
 function fmtCost(n) { return '$' + n.toFixed(4); }

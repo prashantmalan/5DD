@@ -93,5 +93,9 @@ export interface AnthropicRequestBody {
   max_tokens?: number;
   temperature?: number;
   stream?: boolean;
+  thinking?: { type: string; budget_tokens?: number; [key: string]: any };
+  strategy?: { type: string; [key: string]: any };
+  betas?: string[];
+  effort?: string;
   [key: string]: any;
 }

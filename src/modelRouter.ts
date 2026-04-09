@@ -1,13 +1,16 @@
 /**
  * Model Router
- * Automatically selects the cheapest Claude model that can handle the request.
+ * Uses Haiku as a cheap classifier to pick the right model for each request.
  *
- * Cost tiers (as of 2025):
- *   haiku-4-5     → cheapest  (simple Q&A, formatting, classification)
- *   sonnet-4-6    → mid-tier  (coding, analysis, reasoning)
- *   opus-4-6      → expensive (complex multi-step, deep reasoning)
+ * Waterfall:  Haiku → Sonnet → Opus
+ *   simple   → Haiku   (greetings, short Q&A, trivial tasks)
+ *   moderate → Sonnet  (coding, analysis, debugging, explanation)
+ *   complex  → Opus    (deep architecture, multi-system reasoning)
+ *
+ * Only the last user message is sent to the classifier — never the full context.
  */
 
+import * as https from 'https';
 import { AnthropicRequestBody } from './tokenCounter';
 
 export interface RoutingDecision {
@@ -15,6 +18,13 @@ export interface RoutingDecision {
   selectedModel: string;
   reason: string;
   downgraded: boolean;
+}
+
+export interface ModelRouterConfig {
+  enabled: boolean;
+  apiKey?: string;
+  minimumModel?: string;
+  allowOpus?: boolean;   // default false — Opus is very expensive
 }
 
 // Model pricing per 1M tokens (input / output)
@@ -25,111 +35,136 @@ const MODEL_COSTS: Record<string, { input: number; output: number }> = {
   'claude-opus-4-6':           { input: 15.00, output: 75.00 },
 };
 
-const HAIKU_MODELS   = ['claude-haiku-4-5-20251001', 'claude-haiku-4-5'];
-const SONNET_MODELS  = ['claude-sonnet-4-6'];
-const OPUS_MODELS    = ['claude-opus-4-6'];
+const MODEL_HIERARCHY = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-6'];
 
-// Keywords/patterns that signal a simple request (safe to route to haiku)
-const SIMPLE_PATTERNS = [
-  /^(what is|what are|define|explain briefly|list|give me \d+|translate|convert|format|summarize in one|yes or no)/i,
-  /^(fix (the |this )?(typo|grammar|spelling))/i,
-  /^(rename|reformat|prettify|lint|sort)/i,
-  /^(hello|hi|thanks|thank you|ok|okay)/i,
-];
+const CLASSIFIER_PROMPT = `Classify the complexity of this user request. Reply with ONLY one word:
 
-// Keywords that require sonnet or higher
-const COMPLEX_PATTERNS = [
-  /\b(architecture|design pattern|refactor|optimize algorithm|security audit|debug complex)\b/i,
-  /\b(implement|build|create|develop).{20,}/i,
-  /(step[ -]by[ -]step|detailed explanation|walk me through)/i,
-];
+simple   = greeting, thanks, trivial yes/no, one-liner
+moderate = coding task, debugging, explanation, analysis, file edits
+complex  = multi-system architecture, deep research, very long multi-step implementation
 
-// Keywords that require opus
-const EXPERT_PATTERNS = [
-  /\b(PhD|research paper|mathematical proof|formal verification|write a thesis)\b/i,
-  /\b(100[0-9]|[2-9]\d{3})\s*(lines?|loc|functions?)\b/i,
-];
+Request: "{{MESSAGE}}"
+
+Reply:`;
 
 export class ModelRouter {
-  private enabled: boolean;
+  private config: ModelRouterConfig;
   private routingLog: RoutingDecision[] = [];
 
-  constructor(enabled = true) {
-    this.enabled = enabled;
+  constructor(config: ModelRouterConfig | boolean = true) {
+    if (typeof config === 'boolean') {
+      this.config = { enabled: config };
+    } else {
+      this.config = config;
+    }
   }
 
-  route(body: AnthropicRequestBody): RoutingDecision {
+  async route(body: AnthropicRequestBody, requestApiKey?: string): Promise<RoutingDecision> {
     const originalModel = body.model;
-    const decision = this.enabled
-      ? this.decide(body)
-      : { selectedModel: originalModel, reason: 'routing disabled', downgraded: false };
 
+    if (!this.config.enabled) {
+      const result: RoutingDecision = { originalModel, selectedModel: originalModel, reason: 'routing disabled', downgraded: false };
+      this.routingLog.push(result);
+      return result;
+    }
+
+    const decision = await this.decide(body, requestApiKey);
     const result: RoutingDecision = { originalModel, ...decision };
     this.routingLog.push(result);
     return result;
   }
 
-  private decide(body: AnthropicRequestBody): Omit<RoutingDecision, 'originalModel'> {
+  private async decide(body: AnthropicRequestBody, requestApiKey?: string): Promise<Omit<RoutingDecision, 'originalModel'>> {
     const originalModel = body.model;
-    const promptText = this.extractText(body);
-    const promptLength = promptText.length;
+    const lastMessage = this.extractLastUserMessage(body);
 
-    // Don't downgrade if model is already haiku
-    if (HAIKU_MODELS.includes(originalModel)) {
-      return { selectedModel: originalModel, reason: 'already optimal', downgraded: false };
+    // No message text — keep original
+    if (!lastMessage.trim()) {
+      return { selectedModel: originalModel, reason: 'no message text', downgraded: false };
     }
 
-    // Check for expert-level complexity
-    for (const pattern of EXPERT_PATTERNS) {
-      if (pattern.test(promptText)) {
-        if (OPUS_MODELS.includes(originalModel)) {
-          return { selectedModel: originalModel, reason: 'expert complexity detected', downgraded: false };
-        }
-        return { selectedModel: 'claude-opus-4-6', reason: 'expert complexity detected', downgraded: false };
-      }
+    // Classify via Haiku — prefer key from the incoming request so the proxy
+    // works even when claudeOptimizer.anthropicApiKey is not configured in settings
+    const apiKey = requestApiKey || this.config.apiKey || process.env.ANTHROPIC_API_KEY || '';
+    if (!apiKey) {
+      return { selectedModel: originalModel, reason: 'no api key for classifier', downgraded: false };
     }
 
-    // Check for complex patterns — needs sonnet at minimum
-    for (const pattern of COMPLEX_PATTERNS) {
-      if (pattern.test(promptText)) {
-        if (SONNET_MODELS.includes(originalModel) || OPUS_MODELS.includes(originalModel)) {
-          return { selectedModel: originalModel, reason: 'complex task, keeping model', downgraded: false };
-        }
-        return { selectedModel: 'claude-sonnet-4-6', reason: 'complex task pattern', downgraded: false };
-      }
+    let complexity: 'simple' | 'moderate' | 'complex';
+    try {
+      complexity = await withTimeout(this.classify(lastMessage, apiKey), 2000);
+    } catch (err) {
+      console.warn('[ModelRouter] Classifier skipped (timeout or error):', (err as Error).message);
+      return { selectedModel: originalModel, reason: 'classifier skipped', downgraded: false };
     }
 
-    // Long prompts (>2000 chars) suggest complex context — keep sonnet
-    if (promptLength > 2000 && !HAIKU_MODELS.includes(originalModel)) {
-      return { selectedModel: originalModel, reason: 'long context, keeping model', downgraded: false };
-    }
+    const targetModel = this.complexityToModel(complexity);
+    const finalModel = this.applyConstraints(targetModel, originalModel);
+    const downgraded = this.modelRank(finalModel) < this.modelRank(originalModel);
 
-    // Simple patterns → route to haiku
-    for (const pattern of SIMPLE_PATTERNS) {
-      if (pattern.test(promptText.trim())) {
-        return { selectedModel: 'claude-haiku-4-5-20251001', reason: 'simple query pattern', downgraded: true };
-      }
-    }
-
-    // Short, simple prompts → haiku
-    if (promptLength < 200 && body.messages.length <= 2) {
-      return { selectedModel: 'claude-haiku-4-5-20251001', reason: 'short simple prompt', downgraded: true };
-    }
-
-    // Default: keep original
-    return { selectedModel: originalModel, reason: 'no routing rule matched', downgraded: false };
+    return {
+      selectedModel: finalModel,
+      reason: `classifier: ${complexity}`,
+      downgraded,
+    };
   }
 
-  private extractText(body: AnthropicRequestBody): string {
-    const parts: string[] = [];
-    // Only look at the last user message for routing
-    const lastUser = [...body.messages].reverse().find(m => m.role === 'user');
-    if (lastUser) {
-      if (typeof lastUser.content === 'string') {
-        parts.push(lastUser.content);
+  private async classify(message: string, apiKey: string): Promise<'simple' | 'moderate' | 'complex'> {
+    const prompt = CLASSIFIER_PROMPT.replace('{{MESSAGE}}', message.slice(0, 500)); // cap at 500 chars
+
+    const requestBody = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 5,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const raw = await httpsPost('api.anthropic.com', '/v1/messages', apiKey, requestBody);
+    const response = JSON.parse(raw);
+    const text = (response?.content?.[0]?.text || '').trim().toLowerCase();
+
+    if (text.startsWith('simple'))   return 'simple';
+    if (text.startsWith('complex'))  return 'complex';
+    return 'moderate'; // default to moderate if unclear
+  }
+
+  private complexityToModel(complexity: 'simple' | 'moderate' | 'complex'): string {
+    switch (complexity) {
+      case 'simple':   return 'claude-haiku-4-5-20251001';
+      case 'moderate': return 'claude-sonnet-4-6';
+      case 'complex':  return this.config.allowOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
+    }
+  }
+
+  private applyConstraints(targetModel: string, _originalModel: string): string {
+    // Enforce minimum model floor if set
+    if (this.config.minimumModel) {
+      if (this.modelRank(this.config.minimumModel) > this.modelRank(targetModel)) {
+        return this.config.minimumModel;
       }
     }
-    return parts.join(' ');
+    return targetModel;
+  }
+
+  private modelRank(model: string): number {
+    // Higher rank = more capable
+    const idx = MODEL_HIERARCHY.indexOf(model);
+    return idx === -1 ? 1 : idx; // unknown models default to sonnet rank
+  }
+
+  private extractLastUserMessage(body: AnthropicRequestBody): string {
+    const lastUser = [...body.messages].reverse().find(m => m.role === 'user');
+    if (!lastUser) return '';
+
+    if (typeof lastUser.content === 'string') return lastUser.content;
+
+    if (Array.isArray(lastUser.content)) {
+      return lastUser.content
+        .filter((b: any) => b?.type === 'text')
+        .map((b: any) => b.text)
+        .join(' ');
+    }
+
+    return '';
   }
 
   estimateCost(model: string, inputTokens: number, outputTokens: number): number {
@@ -138,9 +173,7 @@ export class ModelRouter {
   }
 
   estimateSavings(originalModel: string, routedModel: string, inputTokens: number, outputTokens: number): number {
-    const originalCost = this.estimateCost(originalModel, inputTokens, outputTokens);
-    const routedCost = this.estimateCost(routedModel, inputTokens, outputTokens);
-    return Math.max(0, originalCost - routedCost);
+    return Math.max(0, this.estimateCost(originalModel, inputTokens, outputTokens) - this.estimateCost(routedModel, inputTokens, outputTokens));
   }
 
   getStats() {
@@ -149,11 +182,46 @@ export class ModelRouter {
       totalRouted: this.routingLog.length,
       downgrades,
       downgradeRate: this.routingLog.length > 0 ? (downgrades / this.routingLog.length) * 100 : 0,
-      log: this.routingLog.slice(-50)
+      log: this.routingLog.slice(-50),
     };
   }
 
   setEnabled(enabled: boolean): void {
-    this.enabled = enabled;
+    this.config.enabled = enabled;
   }
+
+  setConfig(config: Partial<ModelRouterConfig>): void {
+    this.config = { ...this.config, ...config };
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms)),
+  ]);
+}
+
+function httpsPost(hostname: string, path: string, apiKey: string, body: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname,
+      port: 443,
+      path,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => resolve(data));
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }

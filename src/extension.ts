@@ -50,7 +50,13 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   const optimizer = new PromptOptimizer(tokenCounter);
-  const router = new ModelRouter(config.get<boolean>('enableModelRouter', true));
+  const routerConfig = {
+    enabled: config.get<boolean>('enableModelRouter', true),
+    apiKey: config.get<string>('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
+    minimumModel: config.get<string | undefined>('minimumModel'),
+    allowOpus: config.get<boolean>('allowOpus', false),
+  };
+  const router = new ModelRouter(routerConfig);
   stats = new StatsTracker(context);
 
   // ── Context system ────────────────────────────────────────────────────────
@@ -144,6 +150,12 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('claudeOptimizer.clearCache', () => {
       cache.clear();
       vscode.window.showInformationMessage('Cache cleared.');
+    }),
+
+    vscode.commands.registerCommand('claudeOptimizer.clearProxyState', () => {
+      cache.clear();
+      stats.clear();
+      vscode.window.showInformationMessage('Proxy state cleared (cache + stats reset).');
     }),
 
     vscode.commands.registerCommand('claudeOptimizer.optimizeSelection', async () => {

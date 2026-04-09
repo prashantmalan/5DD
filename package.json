@@ -61,6 +61,24 @@
           "default": true,
           "description": "Auto-route simple queries to cheaper models (haiku)"
         },
+        "claudeOptimizer.modelRouterMode": {
+          "type": "string",
+          "enum": ["aggressive", "balanced", "conservative"],
+          "default": "balanced",
+          "description": "Model routing strategy: aggressive (minimize cost), balanced (cost/quality), conservative (preserve quality)"
+        },
+        "claudeOptimizer.minimumModel": {
+          "type": "string",
+          "enum": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"],
+          "default": null,
+          "description": "Never route below this model (null = no floor)"
+        },
+        "claudeOptimizer.allowHaikuFor": {
+          "type": "array",
+          "items": {"type": "string"},
+          "default": ["simple-qa", "formatting"],
+          "description": "Tags/patterns where Haiku is permitted (e.g., 'simple-qa', 'formatting', 'translation')"
+        },
         "claudeOptimizer.enablePromptCompression": {
           "type": "boolean",
           "default": true,
