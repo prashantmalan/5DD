@@ -51,25 +51,44 @@ exports.ProxyServer = void 0;
 const http = __importStar(require("http"));
 const https = __importStar(require("https"));
 const ANTHROPIC_HOST = 'api.anthropic.com';
+const MAX_TRACES = 200;
 class ProxyServer {
-    constructor(config, cache, optimizer, router, tokenCounter, stats) {
+    getTraces(n = 50) {
+        return this.traces.slice(-n).reverse();
+    }
+    constructor(config, cache, optimizer, router, tokenCounter, stats, log) {
         this.server = null;
+        this.traces = [];
         this.config = config;
         this.cache = cache;
         this.optimizer = optimizer;
         this.router = router;
         this.tokenCounter = tokenCounter;
         this.stats = stats;
+        this.log = log ?? ((msg) => console.log(msg));
     }
     start() {
         return new Promise((resolve, reject) => {
             this.server = http.createServer((req, res) => {
-                console.log(`[Claude Optimizer] >> ${req.method} ${req.url} enabled=${this.config.enabled}`);
-                this.handleRequest(req, res).catch(err => {
-                    console.error('[Claude Optimizer] Proxy error:', err);
-                    res.writeHead(500, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: { message: 'Proxy internal error', type: 'proxy_error' } }));
-                });
+                if (req.method === 'POST')
+                    this.log(`>> ${req.method} ${req.url}`);
+                // Safety net: if anything hangs, respond after 60s rather than blocking forever
+                const timeout = setTimeout(() => {
+                    if (!res.headersSent) {
+                        this.log(`ERROR: Request timeout — raw passthrough to Anthropic`);
+                        res.writeHead(504, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: { message: 'Proxy timeout', type: 'proxy_error' } }));
+                    }
+                }, 60000);
+                this.handleRequest(req, res)
+                    .catch(err => {
+                    this.log(`ERROR: Proxy error: ${err}`);
+                    if (!res.headersSent) {
+                        res.writeHead(500, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: { message: 'Proxy internal error', type: 'proxy_error' } }));
+                    }
+                })
+                    .finally(() => clearTimeout(timeout));
             });
             this.server.on('error', (err) => {
                 if (err.code === 'EADDRINUSE') {
@@ -129,29 +148,47 @@ class ProxyServer {
             this.forwardRaw(req, rawBody, res);
             return;
         }
-        console.log(`[Claude Optimizer] Incoming: model=${body.model} thinking=${JSON.stringify(body.thinking)} stream=${body.stream}`);
+        this.log(`[VIA PROXY] model=${body.model} stream=${body.stream}`);
         // ── OPTIMIZATION PIPELINE ────────────────────────────────────────────────
         // Everything below is wrapped in try/catch. If any optimization step fails,
         // we fall back to forwarding the sanitized (but otherwise unmodified) request.
         const isStreaming = body.stream === true;
+        // ── GREETING SHORT-CIRCUIT ────────────────────────────────────────────────
+        // Only intercept single-message conversations (not internal title-gen calls which have no system prompt)
+        const lastMsg = this.extractLastUserMessage(body);
+        const isSingleMessage = body.messages.length === 1 && !body.system;
+        if (this.isGreeting(lastMsg) && !isSingleMessage) {
+            this.log(`[VIA PROXY] Greeting intercepted — not forwarded to Anthropic`);
+            if (isStreaming) {
+                this.greetingResponseSSE(body, res);
+            }
+            else {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(this.greetingResponse(body)));
+            }
+            return;
+        }
         let savedByCompression = 0;
         let techniques = [];
         let modelDowngraded = false;
+        let routingReason = 'passthrough';
         const originalModel = body.model;
         let optimizedBody = body;
+        const requestStart = Date.now();
         try {
             // Token count
             const tokenCountResult = this.tokenCounter.countRequest(body);
             const originalTokens = tokenCountResult.prompt;
-            console.log(`[Claude Optimizer] Request tokens: ${originalTokens}`);
+            this.log(`[VIA PROXY] tokens=${originalTokens}`);
             // 1. Cache check — only for non-streaming requests
             if (this.config.enableCache && !isStreaming) {
                 const cacheResult = this.cache.lookup(body, originalTokens);
                 if (cacheResult.hit && cacheResult.response) {
-                    console.log(`[Claude Optimizer] Cache HIT`);
+                    this.log(`[VIA PROXY] CACHE HIT — not forwarded to Anthropic`);
                     const cacheHitStat = this.buildStat({
                         body, originalModel: body.model, finalModel: body.model,
                         inputTokens: originalTokens, outputTokens: cacheResult.response?.usage?.output_tokens ?? 0,
+                        cacheReadTokens: 0, cacheCreationTokens: 0,
                         savedByCompression: 0, savedByCache: originalTokens, cacheHit: true,
                         modelDowngraded: false, techniques: ['cache-hit'],
                     });
@@ -163,10 +200,12 @@ class ProxyServer {
                 }
             }
             // 2. Prompt optimization
+            // Note: we track techniques but NOT token savings here — Anthropic's prompt caching
+            // makes our pre-send token count unreliable vs the API-reported input_tokens.
             if (this.config.enableCompression) {
                 const result = this.optimizer.optimize(body);
                 optimizedBody = result.body;
-                savedByCompression = result.savedTokens;
+                savedByCompression = 0; // derived post-response from actual API token counts
                 techniques = result.techniques;
             }
             // 3. Model routing
@@ -177,6 +216,7 @@ class ProxyServer {
                 const routing = await this.router.route(optimizedBody, reqApiKey);
                 optimizedBody.model = routing.selectedModel;
                 modelDowngraded = routing.downgraded;
+                routingReason = routing.reason;
                 // When routing to a model that doesn't support thinking, strip everything related
                 if (optimizedBody.model.includes('haiku')) {
                     delete optimizedBody.thinking;
@@ -214,49 +254,66 @@ class ProxyServer {
         }
         catch (e) {
             // Optimization failed — fall back to sanitized original body
-            console.error('[Claude Optimizer] Optimization pipeline failed, forwarding original:', e);
+            this.log(`WARN: Optimization failed, forwarding original to Anthropic: ${e}`);
             optimizedBody = body;
         }
         // Sanitize is now done at every forward point (forwardRaw, forwardToAnthropic, forwardStreaming)
-        console.log(`[Claude Optimizer] Pre-forward: model=${optimizedBody.model} thinking=${JSON.stringify(optimizedBody.thinking)} strategy=${JSON.stringify(optimizedBody.strategy)}`);
+        this.log(`[VIA PROXY → ANTHROPIC] model=${optimizedBody.model}${modelDowngraded ? ` (routed from ${originalModel})` : ''} tokens=${this.tokenCounter.countRequest(optimizedBody).prompt}`);
         // ── FORWARD ──────────────────────────────────────────────────────────────
         // If anything goes wrong forwarding the optimized body, fall back to the
         // original raw request as an absolute last resort.
         try {
             if (isStreaming) {
-                this.forwardStreaming(req, optimizedBody, res, (inputTokens, outputTokens) => {
+                this.forwardStreaming(req, optimizedBody, res, (inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens) => {
                     const finalInputTokens = inputTokens || this.tokenCounter.countRequest(body).prompt;
                     this.stats.record(this.buildStat({
                         body: optimizedBody, originalModel, finalModel: optimizedBody.model,
-                        inputTokens: finalInputTokens, outputTokens, savedByCompression,
-                        savedByCache: 0, cacheHit: false, modelDowngraded, techniques,
+                        inputTokens: finalInputTokens, outputTokens,
+                        cacheReadTokens, cacheCreationTokens,
+                        savedByCompression, savedByCache: 0, cacheHit: false, modelDowngraded, techniques,
                     }));
+                    this.recordTrace({
+                        originalModel, finalModel: optimizedBody.model, routingReason,
+                        inputTokens: finalInputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+                        savedByCompression, techniques, streaming: true, requestStart,
+                    });
                 });
             }
             else {
                 const response = await this.forwardWithFallback(req, optimizedBody);
                 // Last resort: if optimized request errored and it was modified, retry with raw
                 if (response?.error && optimizedBody !== body) {
-                    console.warn('[Claude Optimizer] Optimized request failed, retrying with original');
+                    this.log(`WARN: Optimized request failed, retrying original → Anthropic`);
                     this.forwardRaw(req, rawBody, res);
                     return;
                 }
                 const inputTokens = response?.usage?.input_tokens ?? this.tokenCounter.countRequest(body).prompt;
                 const outputTokens = response?.usage?.output_tokens ?? 0;
+                const cacheReadTokens = response?.usage?.cache_read_input_tokens ?? 0;
+                const cacheCreationTokens = response?.usage?.cache_creation_input_tokens ?? 0;
+                // Compression savings = difference between our pre-send estimate and actual API tokens
+                const estimatedOriginal = this.tokenCounter.countRequest(body).prompt;
+                const actualSavedByCompression = Math.max(0, estimatedOriginal - inputTokens);
                 if (this.config.enableCache && !response?.error) {
                     this.cache.store(optimizedBody, response, inputTokens);
                 }
                 this.stats.record(this.buildStat({
                     body: optimizedBody, originalModel, finalModel: optimizedBody.model,
-                    inputTokens, outputTokens, savedByCompression,
+                    inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+                    savedByCompression: actualSavedByCompression,
                     savedByCache: 0, cacheHit: false, modelDowngraded, techniques,
                 }));
+                this.recordTrace({
+                    originalModel, finalModel: optimizedBody.model, routingReason,
+                    inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+                    savedByCompression: actualSavedByCompression, techniques, streaming: false, requestStart,
+                });
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(response));
             }
         }
         catch (e) {
-            console.error('[Claude Optimizer] Forward failed, raw passthrough:', e);
+            this.log(`ERROR: Forward failed, raw passthrough → Anthropic: ${e}`);
             this.forwardRaw(req, rawBody, res);
         }
     }
@@ -276,7 +333,7 @@ class ProxyServer {
             const currentIdx = MODEL_ESCALATION.indexOf(currentBody.model);
             if (currentIdx !== -1 && currentIdx < MODEL_ESCALATION.length - 1) {
                 const nextModel = MODEL_ESCALATION[currentIdx + 1];
-                console.warn(`[Claude Optimizer] Model ${currentBody.model} rejected request (${response.error.message?.slice(0, 80)}), escalating to ${nextModel}`);
+                this.log(`WARN: ${currentBody.model} rejected (${response.error.message?.slice(0, 60)}), escalating → ${nextModel}`);
                 currentBody = { ...currentBody, model: nextModel };
                 // If thinking isn't enabled, ensure strategy is also stripped on escalation
                 if (!currentBody.thinking || (currentBody.thinking.type !== 'enabled' && currentBody.thinking.type !== 'adaptive')) {
@@ -316,7 +373,7 @@ class ProxyServer {
                         const currentIdx = MODEL_ESCALATION.indexOf(currentBody.model);
                         if (currentIdx !== -1 && currentIdx < MODEL_ESCALATION.length - 1) {
                             const nextModel = MODEL_ESCALATION[currentIdx + 1];
-                            console.warn(`[Claude Optimizer] Streaming: ${currentBody.model} rejected (${parsed?.error?.message?.slice(0, 80)}), escalating to ${nextModel}`);
+                            this.log(`WARN: Streaming: ${currentBody.model} rejected (${parsed?.error?.message?.slice(0, 60)}), escalating → ${nextModel}`);
                             const escalated = { ...currentBody, model: nextModel };
                             if (!escalated.thinking || (escalated.thinking.type !== 'enabled' && escalated.thinking.type !== 'adaptive')) {
                                 delete escalated.strategy;
@@ -329,7 +386,7 @@ class ProxyServer {
                         else {
                             res.writeHead(400, { 'Content-Type': 'application/json' });
                             res.end(errData);
-                            onDone(0, 0);
+                            onDone(0, 0, 0, 0);
                         }
                     });
                     return;
@@ -338,17 +395,27 @@ class ProxyServer {
                 let buffer = '';
                 let inputTokens = 0;
                 let outputTokens = 0;
+                let cacheReadTokens = 0;
+                let cacheCreationTokens = 0;
                 proxyRes.on('data', (chunk) => {
                     res.write(chunk);
                     buffer += chunk.toString();
+                    // Parse usage fields from SSE events (message_start carries input counts,
+                    // message_delta carries the final output count)
                     const inputMatch = buffer.match(/"input_tokens":(\d+)/);
                     const outputMatch = buffer.match(/"output_tokens":(\d+)/);
+                    const cacheReadMatch = buffer.match(/"cache_read_input_tokens":(\d+)/);
+                    const cacheCreateMatch = buffer.match(/"cache_creation_input_tokens":(\d+)/);
                     if (inputMatch)
                         inputTokens = parseInt(inputMatch[1]);
                     if (outputMatch)
                         outputTokens = parseInt(outputMatch[1]);
+                    if (cacheReadMatch)
+                        cacheReadTokens = parseInt(cacheReadMatch[1]);
+                    if (cacheCreateMatch)
+                        cacheCreationTokens = parseInt(cacheCreateMatch[1]);
                 });
-                proxyRes.on('end', () => { res.end(); onDone(inputTokens, outputTokens); });
+                proxyRes.on('end', () => { res.end(); onDone(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens); });
                 proxyRes.on('error', () => res.end());
             });
             proxyReq.on('error', () => { res.writeHead(502); res.end('Bad Gateway'); });
@@ -381,6 +448,62 @@ class ProxyServer {
             proxyReq.write(bodyStr);
             proxyReq.end();
         });
+    }
+    extractLastUserMessage(body) {
+        const last = [...body.messages].reverse().find(m => m.role === 'user');
+        if (!last)
+            return '';
+        if (typeof last.content === 'string')
+            return last.content;
+        if (Array.isArray(last.content)) {
+            return last.content.filter((b) => b?.type === 'text').map((b) => b.text).join(' ');
+        }
+        return '';
+    }
+    isGreeting(msg) {
+        return /^\s*(hi+|hello+|hey+|howdy|greetings|sup|yo|hiya|good\s+(morning|afternoon|evening)|what'?s\s+up)\s*[!?.]*\s*$/i.test(msg.trim());
+    }
+    greetingResponseSSE(body, res) {
+        const replies = [
+            "Oh good, a greeting. My favourite. What are we actually building today?",
+            "Hi. Tokens spent: ~5. Was it worth it? Let's get to work.",
+            "Revolutionary opener. What's the real question?",
+            "Hello to you too. Now — what needs fixing?",
+        ];
+        const text = replies[Math.floor(Math.random() * replies.length)];
+        const msgId = `msg_steward_${Date.now()}`;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+        const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        send('message_start', { type: 'message_start', message: {
+                id: msgId, type: 'message', role: 'assistant', content: [],
+                model: body.model, stop_reason: null, stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 0 }
+            } });
+        send('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+        res.write('event: ping\ndata: {"type":"ping"}\n\n');
+        send('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
+        send('content_block_stop', { type: 'content_block_stop', index: 0 });
+        send('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: text.split(' ').length } });
+        send('message_stop', { type: 'message_stop' });
+        res.end();
+    }
+    greetingResponse(body) {
+        const replies = [
+            "Oh good, a greeting. My favourite. What are we actually building today?",
+            "Hi. Tokens spent: ~5. Was it worth it? Let's get to work.",
+            "Revolutionary opener. What's the real question?",
+            "Hello to you too. Now — what needs fixing?",
+        ];
+        const text = replies[Math.floor(Math.random() * replies.length)];
+        return {
+            id: `msg_steward_${Date.now()}`,
+            type: 'message',
+            role: 'assistant',
+            model: body.model,
+            content: [{ type: 'text', text }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 1, output_tokens: text.split(' ').length },
+        };
     }
     /**
      * Ensure thinking/strategy consistency in a parsed body.
@@ -463,16 +586,38 @@ class ProxyServer {
             proxyReq.write(finalBody);
         proxyReq.end();
     }
+    recordTrace(params) {
+        const trace = {
+            id: Math.random().toString(36).slice(2, 8),
+            timestamp: Date.now(),
+            originalModel: params.originalModel,
+            finalModel: params.finalModel,
+            routingReason: params.routingReason,
+            inputTokens: params.inputTokens,
+            outputTokens: params.outputTokens,
+            cacheReadTokens: params.cacheReadTokens,
+            cacheCreationTokens: params.cacheCreationTokens,
+            savedByCompression: params.savedByCompression,
+            techniques: params.techniques,
+            streaming: params.streaming,
+            durationMs: Date.now() - params.requestStart,
+        };
+        this.traces.push(trace);
+        if (this.traces.length > MAX_TRACES)
+            this.traces.shift();
+    }
     buildStat(params) {
         // Cache hits don't incur API costs since they're served from cache
         const costUSD = params.cacheHit ? 0 : this.router.estimateCost(params.finalModel, params.inputTokens, params.outputTokens);
-        const savedCostUSD = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens) + (params.savedByCompression / 1000000) * 3.0;
+        const savedCostUSD = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens) + (params.savedByCompression / 1000000) * this.router.inputPriceFor(params.originalModel);
         return {
             timestamp: Date.now(),
             model: params.finalModel,
             originalModel: params.originalModel,
             inputTokens: params.inputTokens,
             outputTokens: params.outputTokens,
+            cacheReadTokens: params.cacheReadTokens,
+            cacheCreationTokens: params.cacheCreationTokens,
             savedTokensByCompression: params.savedByCompression,
             savedTokensByCache: params.savedByCache,
             cacheHit: params.cacheHit,

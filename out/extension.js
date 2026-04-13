@@ -43,6 +43,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.out = void 0;
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
@@ -55,7 +56,7 @@ const proxyServer_1 = require("./proxyServer");
 const logMonitor_1 = require("./logMonitor");
 const gitMonitor_1 = require("./gitMonitor");
 const contextBuilder_1 = require("./contextBuilder");
-const dashboardPanel_1 = require("./dashboard/dashboardPanel");
+const dashboardServer_1 = require("./dashboard/dashboardServer");
 // Integrations
 const jiraIntegration_1 = require("./integrations/jiraIntegration");
 const confluenceIntegration_1 = require("./integrations/confluenceIntegration");
@@ -69,7 +70,9 @@ let proxy = null;
 let tokenCounter;
 let stats;
 async function activate(context) {
-    console.log('[Claude Optimizer] Activating...');
+    exports.out = vscode.window.createOutputChannel('Claude Steward');
+    context.subscriptions.push(exports.out);
+    exports.out.appendLine('[Claude Steward] Activating...');
     const config = vscode.workspace.getConfiguration('claudeOptimizer');
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
     // ── Core modules ──────────────────────────────────────────────────────────
@@ -113,19 +116,52 @@ async function activate(context) {
         enableModelRouter: config.get('enableModelRouter', true),
         apiKey: config.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
     };
-    proxy = new proxyServer_1.ProxyServer(proxyConfig, cache, optimizer, router, tokenCounter, stats);
-    // Auto-start proxy
+    proxy = new proxyServer_1.ProxyServer(proxyConfig, cache, optimizer, router, tokenCounter, stats, (msg) => exports.out.appendLine(`[${new Date().toISOString().slice(11, 19)}] ${msg}`));
+    // ── Dashboard HTTP server ─────────────────────────────────────────────────
+    const dashboardPort = config.get('dashboardPort', 8788);
+    const dashboardServer = new dashboardServer_1.DashboardServer(stats, dashboardPort, () => proxy.getTraces());
+    let dashboardUrl = `http://localhost:${dashboardPort}`;
+    try {
+        dashboardUrl = await dashboardServer.start();
+        console.log(`[Claude Optimizer] Dashboard at ${dashboardUrl}`);
+    }
+    catch {
+        console.warn('[Claude Optimizer] Dashboard server failed to start');
+    }
+    context.subscriptions.push({ dispose: () => dashboardServer.stop() });
+    // Auto-start proxy. If port is already taken, another VS Code window owns it — attach to it.
+    const proxyUrl = `http://localhost:${proxyConfig.port}`;
     try {
         await proxy.start();
+        process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
+        exports.out.appendLine(`[PROXY UP] Listening on ${proxyUrl} — all Claude Code traffic routes through us`);
+        exports.out.appendLine(`[DASHBOARD] ${dashboardUrl}`);
+        exports.out.appendLine(`⚠️  IMPORTANT: Reload VS Code window to activate routing through the proxy`);
+        exports.out.show(true);
         updateStatusBar(0, true);
-        vscode.window.showInformationMessage(`Claude Optimizer: Proxy running on port ${proxyConfig.port}. Set ANTHROPIC_BASE_URL=http://localhost:${proxyConfig.port}`);
+        vscode.window.showInformationMessage(`Claude Steward: Proxy ready. Reload window to activate routing.`, 'Reload Now').then(choice => {
+            if (choice === 'Reload Now') {
+                vscode.commands.executeCommand('workbench.action.reloadWindow');
+            }
+        });
     }
     catch (err) {
-        vscode.window.showWarningMessage(`Claude Optimizer: ${err.message}`);
+        if (err.message?.includes('already in use')) {
+            // Another window's proxy is running — attach to it
+            process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
+            exports.out.appendLine(`[PROXY] Port ${proxyConfig.port} already in use — attaching to existing proxy`);
+            exports.out.show(true);
+            updateStatusBar(0, true);
+            vscode.window.showInformationMessage(`Claude Steward: Attached to existing proxy on :${proxyConfig.port}`);
+        }
+        else {
+            exports.out.appendLine(`[PROXY ERROR] ${err.message}`);
+            vscode.window.showWarningMessage(`Claude Steward: proxy failed to start — ${err.message}.`);
+        }
     }
     // ── Commands ──────────────────────────────────────────────────────────────
     context.subscriptions.push(vscode.commands.registerCommand('claudeOptimizer.showDashboard', () => {
-        dashboardPanel_1.DashboardPanel.show(context, stats);
+        vscode.env.openExternal(vscode.Uri.parse(dashboardUrl));
     }), vscode.commands.registerCommand('claudeOptimizer.toggle', () => {
         if (!proxy?.isRunning()) {
             vscode.window.showWarningMessage('Claude Optimizer: Proxy is not running. Press F5 first.');
@@ -193,6 +229,7 @@ async function activate(context) {
     context.subscriptions.push({
         dispose: async () => {
             await proxy?.stop();
+            delete process.env['ANTHROPIC_BASE_URL'];
             logMonitor.dispose();
             tokenCounter.dispose();
             stats.dispose();
@@ -200,8 +237,13 @@ async function activate(context) {
     });
     console.log('[Claude Optimizer] Active. Proxy:', proxy.isRunning() ? 'running' : 'stopped');
 }
-function deactivate() {
-    proxy?.stop();
+async function deactivate() {
+    delete process.env['ANTHROPIC_BASE_URL'];
+    try {
+        exports.out.appendLine(`⚠️  IMPORTANT: Reload VS Code window to stop routing through the proxy`);
+    }
+    catch { }
+    await proxy?.stop();
 }
 // ── Helpers ────────────────────────────────────────────────────────────────
 function updateStatusBar(savedTokens, proxyRunning, optimizerEnabled = true) {

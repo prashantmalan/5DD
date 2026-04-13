@@ -170,6 +170,9 @@ class ModelRouter {
         const costs = MODEL_COSTS[model] || MODEL_COSTS['claude-sonnet-4-6'];
         return (inputTokens / 1000000) * costs.input + (outputTokens / 1000000) * costs.output;
     }
+    inputPriceFor(model) {
+        return (MODEL_COSTS[model] || MODEL_COSTS['claude-sonnet-4-6']).input;
+    }
     estimateSavings(originalModel, routedModel, inputTokens, outputTokens) {
         return Math.max(0, this.estimateCost(originalModel, inputTokens, outputTokens) - this.estimateCost(routedModel, inputTokens, outputTokens));
     }

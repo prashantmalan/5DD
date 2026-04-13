@@ -9,8 +9,10 @@ export interface RequestStat {
   timestamp: number;
   model: string;
   originalModel: string;
-  inputTokens: number;
+  inputTokens: number;        // new tokens billed at full input price
   outputTokens: number;
+  cacheReadTokens: number;    // Anthropic's prompt cache reads (billed at ~10%)
+  cacheCreationTokens: number; // Anthropic's prompt cache writes (billed at ~125%)
   savedTokensByCompression: number;
   savedTokensByCache: number;
   cacheHit: boolean;

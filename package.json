@@ -1,9 +1,14 @@
 {
-  "name": "claude-token-optimizer",
-  "displayName": "Claude Token Optimizer",
-  "description": "Background tool to minimize Claude token usage and maximize efficiency",
-  "version": "1.0.0",
-  "publisher": "claude-optimizer",
+  "name": "claude-steward",
+  "displayName": "Claude Steward — 5DD Plan",
+  "description": "Cut your Claude API costs to $5 a day. Claude Steward runs silently in the background — routing requests to the cheapest capable model, caching repeated queries, compressing prompts, and enforcing interaction governance so nothing leaks and nothing wastes.",
+  "version": "1.1.7",
+  "publisher": "PrashantMalan",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/claude-optimizer/claude-token-optimizer"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
