@@ -66,6 +66,8 @@ class ProxyServer {
         this.tokenCounter = tokenCounter;
         this.stats = stats;
         this.log = log ?? ((msg) => console.log(msg));
+        // Capture original https.request NOW (before NetworkInterceptor patches it)
+        this.httpsRequest = https.request.bind(https);
     }
     start() {
         return new Promise((resolve, reject) => {
@@ -105,13 +107,17 @@ class ProxyServer {
     }
     stop() {
         return new Promise((resolve) => {
-            if (this.server) {
-                this.server.close(() => resolve());
-                this.server = null;
-            }
-            else {
+            if (!this.server) {
                 resolve();
+                return;
             }
+            const s = this.server;
+            this.server = null; // mark as stopped so isRunning() returns false immediately
+            // closeAllConnections() (Node 18.2+) force-closes keep-alive sockets so close() resolves promptly
+            if (typeof s.closeAllConnections === 'function') {
+                s.closeAllConnections();
+            }
+            s.close(() => resolve());
         });
     }
     isRunning() {
@@ -129,6 +135,12 @@ class ProxyServer {
         return this.config.enabled;
     }
     async handleRequest(req, res) {
+        // Health-check used by the NetworkInterceptor self-test
+        if (req.url === '/health' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, port: this.config.port }));
+            return;
+        }
         const rawBody = await readBody(req);
         // Master switch OFF → pass through completely unchanged
         if (!this.config.enabled) {
@@ -154,10 +166,10 @@ class ProxyServer {
         // we fall back to forwarding the sanitized (but otherwise unmodified) request.
         const isStreaming = body.stream === true;
         // ── GREETING SHORT-CIRCUIT ────────────────────────────────────────────────
-        // Only intercept single-message conversations (not internal title-gen calls which have no system prompt)
+        // Only intercept bare single-message greetings (not internal title-gen calls which also have no system prompt but have history)
         const lastMsg = this.extractLastUserMessage(body);
         const isSingleMessage = body.messages.length === 1 && !body.system;
-        if (this.isGreeting(lastMsg) && !isSingleMessage) {
+        if (this.isGreeting(lastMsg) && isSingleMessage) {
             this.log(`[VIA PROXY] Greeting intercepted — not forwarded to Anthropic`);
             if (isStreaming) {
                 this.greetingResponseSSE(body, res);
@@ -168,17 +180,16 @@ class ProxyServer {
             }
             return;
         }
-        let savedByCompression = 0;
         let techniques = [];
         let modelDowngraded = false;
         let routingReason = 'passthrough';
         const originalModel = body.model;
         let optimizedBody = body;
         const requestStart = Date.now();
+        // Hoisted so the streaming callback (outside the try block) can read it.
+        let originalTokens = this.tokenCounter.countRequest(body).prompt;
         try {
-            // Token count
-            const tokenCountResult = this.tokenCounter.countRequest(body);
-            const originalTokens = tokenCountResult.prompt;
+            // Token count (re-use the already-computed value above)
             this.log(`[VIA PROXY] tokens=${originalTokens}`);
             // 1. Cache check — only for non-streaming requests
             if (this.config.enableCache && !isStreaming) {
@@ -205,7 +216,6 @@ class ProxyServer {
             if (this.config.enableCompression) {
                 const result = this.optimizer.optimize(body);
                 optimizedBody = result.body;
-                savedByCompression = 0; // derived post-response from actual API token counts
                 techniques = result.techniques;
             }
             // 3. Model routing
@@ -265,17 +275,21 @@ class ProxyServer {
         try {
             if (isStreaming) {
                 this.forwardStreaming(req, optimizedBody, res, (inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens) => {
-                    const finalInputTokens = inputTokens || this.tokenCounter.countRequest(body).prompt;
+                    const finalInputTokens = inputTokens || originalTokens;
+                    // Mirror the non-streaming savings computation: compare pre-optimization token
+                    // estimate against what the API actually billed (input_tokens only; cache reads
+                    // are already a form of savings tracked separately).
+                    const actualSavedByCompression = Math.max(0, originalTokens - finalInputTokens);
                     this.stats.record(this.buildStat({
                         body: optimizedBody, originalModel, finalModel: optimizedBody.model,
                         inputTokens: finalInputTokens, outputTokens,
                         cacheReadTokens, cacheCreationTokens,
-                        savedByCompression, savedByCache: 0, cacheHit: false, modelDowngraded, techniques,
+                        savedByCompression: actualSavedByCompression, savedByCache: 0, cacheHit: false, modelDowngraded, techniques,
                     }));
                     this.recordTrace({
                         originalModel, finalModel: optimizedBody.model, routingReason,
                         inputTokens: finalInputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
-                        savedByCompression, techniques, streaming: true, requestStart,
+                        savedByCompression: actualSavedByCompression, techniques, streaming: true, requestStart,
                     });
                 });
             }
@@ -287,13 +301,11 @@ class ProxyServer {
                     this.forwardRaw(req, rawBody, res);
                     return;
                 }
-                const inputTokens = response?.usage?.input_tokens ?? this.tokenCounter.countRequest(body).prompt;
+                const inputTokens = response?.usage?.input_tokens ?? originalTokens;
                 const outputTokens = response?.usage?.output_tokens ?? 0;
                 const cacheReadTokens = response?.usage?.cache_read_input_tokens ?? 0;
                 const cacheCreationTokens = response?.usage?.cache_creation_input_tokens ?? 0;
-                // Compression savings = difference between our pre-send estimate and actual API tokens
-                const estimatedOriginal = this.tokenCounter.countRequest(body).prompt;
-                const actualSavedByCompression = Math.max(0, estimatedOriginal - inputTokens);
+                const actualSavedByCompression = Math.max(0, originalTokens - inputTokens);
                 if (this.config.enableCache && !response?.error) {
                     this.cache.store(optimizedBody, response, inputTokens);
                 }
@@ -335,10 +347,12 @@ class ProxyServer {
                 const nextModel = MODEL_ESCALATION[currentIdx + 1];
                 this.log(`WARN: ${currentBody.model} rejected (${response.error.message?.slice(0, 60)}), escalating → ${nextModel}`);
                 currentBody = { ...currentBody, model: nextModel };
-                // If thinking isn't enabled, ensure strategy is also stripped on escalation
+                // If thinking isn't enabled, strip all extended-thinking / context fields on escalation
                 if (!currentBody.thinking || (currentBody.thinking.type !== 'enabled' && currentBody.thinking.type !== 'adaptive')) {
                     delete currentBody.strategy;
                     delete currentBody.thinking;
+                    delete currentBody.context_management;
+                    delete currentBody.output_config;
                 }
                 continue;
             }
@@ -353,7 +367,7 @@ class ProxyServer {
             this.sanitizeThinkingFields(currentBody, req);
             const bodyStr = JSON.stringify(currentBody);
             const headers = this.buildForwardHeaders(req, bodyStr, currentBody.model, currentBody);
-            const proxyReq = https.request({
+            const proxyReq = this.httpsRequest({
                 hostname: ANTHROPIC_HOST,
                 port: 443,
                 path: req.url || '/v1/messages',
@@ -400,16 +414,18 @@ class ProxyServer {
                 proxyRes.on('data', (chunk) => {
                     res.write(chunk);
                     buffer += chunk.toString();
-                    // Parse usage fields from SSE events (message_start carries input counts,
-                    // message_delta carries the final output count)
+                    // Parse usage fields from SSE events:
+                    //   message_start carries input_tokens and cache counts (appear once)
+                    //   message_delta carries the FINAL output_tokens (use last match since
+                    //   message_start also emits output_tokens: 1 which would shadow the real count)
                     const inputMatch = buffer.match(/"input_tokens":(\d+)/);
-                    const outputMatch = buffer.match(/"output_tokens":(\d+)/);
+                    const outputMatches = [...buffer.matchAll(/"output_tokens":(\d+)/g)];
                     const cacheReadMatch = buffer.match(/"cache_read_input_tokens":(\d+)/);
                     const cacheCreateMatch = buffer.match(/"cache_creation_input_tokens":(\d+)/);
                     if (inputMatch)
                         inputTokens = parseInt(inputMatch[1]);
-                    if (outputMatch)
-                        outputTokens = parseInt(outputMatch[1]);
+                    if (outputMatches.length > 0)
+                        outputTokens = parseInt(outputMatches[outputMatches.length - 1][1]);
                     if (cacheReadMatch)
                         cacheReadTokens = parseInt(cacheReadMatch[1]);
                     if (cacheCreateMatch)
@@ -429,7 +445,7 @@ class ProxyServer {
             this.sanitizeThinkingFields(body, req);
             const bodyStr = JSON.stringify(body);
             const headers = this.buildForwardHeaders(req, bodyStr, body.model, body);
-            const proxyReq = https.request({
+            const proxyReq = this.httpsRequest({
                 hostname: ANTHROPIC_HOST, port: 443,
                 path: req.url || '/v1/messages', method: 'POST', headers
             }, (proxyRes) => {
@@ -574,7 +590,7 @@ class ProxyServer {
             method: req.method,
             headers: { ...req.headers, host: ANTHROPIC_HOST, 'content-length': String(Buffer.byteLength(finalBody)) }
         };
-        const proxyReq = https.request(options, (proxyRes) => {
+        const proxyReq = this.httpsRequest(options, (proxyRes) => {
             res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
             proxyRes.pipe(res);
         });
@@ -607,9 +623,15 @@ class ProxyServer {
             this.traces.shift();
     }
     buildStat(params) {
-        // Cache hits don't incur API costs since they're served from cache
-        const costUSD = params.cacheHit ? 0 : this.router.estimateCost(params.finalModel, params.inputTokens, params.outputTokens);
-        const savedCostUSD = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens) + (params.savedByCompression / 1000000) * this.router.inputPriceFor(params.originalModel);
+        // Cache hits don't incur API costs since they're served from proxy cache
+        const costUSD = params.cacheHit ? 0 : this.router.estimateCost(params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens);
+        // Savings sources:
+        //   1. Model routing:     cheaper model selected → delta between original and final model cost
+        //   2. Compression:       tokens eliminated before sending → saved at original model's input rate
+        //   3. Anthropic cache:   cache_read_input_tokens are billed at 10% → 90% of those tokens saved
+        const anthropicCacheSavings = (params.cacheReadTokens / 1000000) * this.router.inputPriceFor(params.finalModel) * 0.90;
+        const savedCostUSD = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens) + (params.savedByCompression / 1000000) * this.router.inputPriceFor(params.originalModel)
+            + anthropicCacheSavings;
         return {
             timestamp: Date.now(),
             model: params.finalModel,

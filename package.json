@@ -2,7 +2,7 @@
   "name": "claude-steward",
   "displayName": "Claude Steward — 5DD Plan",
   "description": "Cut your Claude API costs to $5 a day. Claude Steward runs silently in the background — routing requests to the cheapest capable model, caching repeated queries, compressing prompts, and enforcing interaction governance so nothing leaks and nothing wastes.",
-  "version": "1.1.7",
+  "version": "1.2.0",
   "publisher": "PrashantMalan",
   "repository": {
     "type": "git",
@@ -12,9 +12,20 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other", "Machine Learning"],
-  "keywords": ["claude", "anthropic", "token", "optimization", "ai"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "claude",
+    "anthropic",
+    "token",
+    "optimization",
+    "ai"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -68,20 +79,33 @@
         },
         "claudeOptimizer.modelRouterMode": {
           "type": "string",
-          "enum": ["aggressive", "balanced", "conservative"],
+          "enum": [
+            "aggressive",
+            "balanced",
+            "conservative"
+          ],
           "default": "balanced",
           "description": "Model routing strategy: aggressive (minimize cost), balanced (cost/quality), conservative (preserve quality)"
         },
         "claudeOptimizer.minimumModel": {
           "type": "string",
-          "enum": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"],
+          "enum": [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6"
+          ],
           "default": null,
           "description": "Never route below this model (null = no floor)"
         },
         "claudeOptimizer.allowHaikuFor": {
           "type": "array",
-          "items": {"type": "string"},
-          "default": ["simple-qa", "formatting"],
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "simple-qa",
+            "formatting"
+          ],
           "description": "Tags/patterns where Haiku is permitted (e.g., 'simple-qa', 'formatting', 'translation')"
         },
         "claudeOptimizer.enablePromptCompression": {

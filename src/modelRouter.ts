@@ -167,17 +167,37 @@ export class ModelRouter {
     return '';
   }
 
-  estimateCost(model: string, inputTokens: number, outputTokens: number): number {
+  estimateCost(
+    model: string,
+    inputTokens: number,
+    outputTokens: number,
+    cacheReadTokens = 0,
+    cacheCreationTokens = 0,
+  ): number {
     const costs = MODEL_COSTS[model] || MODEL_COSTS['claude-sonnet-4-6'];
-    return (inputTokens / 1_000_000) * costs.input + (outputTokens / 1_000_000) * costs.output;
+    return (inputTokens         / 1_000_000) * costs.input
+         + (outputTokens        / 1_000_000) * costs.output
+         + (cacheReadTokens     / 1_000_000) * costs.input * 0.10   // Anthropic charges 10%
+         + (cacheCreationTokens / 1_000_000) * costs.input * 1.25;  // Anthropic charges 125%
   }
 
   inputPriceFor(model: string): number {
     return (MODEL_COSTS[model] || MODEL_COSTS['claude-sonnet-4-6']).input;
   }
 
-  estimateSavings(originalModel: string, routedModel: string, inputTokens: number, outputTokens: number): number {
-    return Math.max(0, this.estimateCost(originalModel, inputTokens, outputTokens) - this.estimateCost(routedModel, inputTokens, outputTokens));
+  estimateSavings(
+    originalModel: string,
+    routedModel: string,
+    inputTokens: number,
+    outputTokens: number,
+    cacheReadTokens = 0,
+    cacheCreationTokens = 0,
+  ): number {
+    return Math.max(
+      0,
+      this.estimateCost(originalModel, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens) -
+      this.estimateCost(routedModel,   inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens),
+    );
   }
 
   getStats() {

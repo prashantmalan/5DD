@@ -10,12 +10,14 @@
  */
 
 import * as vscode from 'vscode';
+import * as net from 'net';
 import { TokenCounter } from './tokenCounter';
 import { PromptOptimizer } from './promptOptimizer';
 import { SemanticCache } from './semanticCache';
 import { ModelRouter } from './modelRouter';
 import { StatsTracker } from './statsTracker';
 import { ProxyServer, ProxyConfig } from './proxyServer';
+import { NetworkInterceptor } from './networkInterceptor';
 import { LogMonitor } from './logMonitor';
 import { GitMonitor } from './gitMonitor';
 import { ContextBuilder } from './contextBuilder';
@@ -34,6 +36,9 @@ let statusBarItem: vscode.StatusBarItem;
 let proxy: ProxyServer | null = null;
 let tokenCounter: TokenCounter;
 let stats: StatsTracker;
+let healthCheckInterval: NodeJS.Timeout | null = null;
+let isAttachedToExistingProxy = false;
+let interceptor: NetworkInterceptor | null = null;
 
 export let out: vscode.OutputChannel;
 
@@ -113,34 +118,75 @@ export async function activate(context: vscode.ExtensionContext) {
   }
   context.subscriptions.push({ dispose: () => dashboardServer.stop() });
 
-  // Auto-start proxy. If port is already taken, another VS Code window owns it — attach to it.
+  // ── Env-var helpers — use environmentVariableCollection so ALL terminals (existing + new)
+  //    get ANTHROPIC_BASE_URL immediately, and VS Code clears it automatically on disable/uninstall.
   const proxyUrl = `http://localhost:${proxyConfig.port}`;
+  const envColl = context.environmentVariableCollection;
+  envColl.description = new vscode.MarkdownString('Set by **Claude Steward** to route Claude Code traffic through the local optimising proxy.');
+
+  interceptor = new NetworkInterceptor(proxyConfig.port);
+
+  function activateRouting() {
+    process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
+    envColl.replace('ANTHROPIC_BASE_URL', proxyUrl);
+    interceptor!.install();
+  }
+  function deactivateRouting() {
+    delete process.env['ANTHROPIC_BASE_URL'];
+    envColl.delete('ANTHROPIC_BASE_URL');
+    interceptor!.uninstall();
+  }
+
+  // Start health-check loop for the attached-window case (extracted to avoid duplication)
+  function startHealthCheck() {
+    healthCheckInterval = setInterval(async () => {
+      if (await isProxyAlive(proxyConfig.port)) return;
+
+      clearInterval(healthCheckInterval!);
+      healthCheckInterval = null;
+      isAttachedToExistingProxy = false;
+      out.appendLine('[PROXY] Attached proxy died — attempting to take ownership');
+
+      try {
+        await proxy!.start();
+        activateRouting();
+        updateStatusBar(stats.getSessionStats().totalSavedTokens, true);
+        out.appendLine('[PROXY] Took ownership — now the primary proxy');
+        vscode.window.showInformationMessage('Claude Steward: Proxy restarted — this window is now the owner.');
+      } catch {
+        // Race: another window may have beaten us — give it a moment then check
+        await new Promise(r => setTimeout(r, 500));
+        if (await isProxyAlive(proxyConfig.port)) {
+          isAttachedToExistingProxy = true;
+          activateRouting();
+          out.appendLine('[PROXY] Another window restarted the proxy — re-attached');
+          startHealthCheck();
+        } else {
+          deactivateRouting();
+          updateStatusBar(0, false);
+          out.appendLine('[PROXY] Could not restart proxy — routing deactivated');
+          vscode.window.showWarningMessage('Claude Steward: Proxy stopped and could not restart.');
+        }
+      }
+    }, 10_000);
+  }
+
+  // Auto-start proxy. If port is already taken, another VS Code window owns it — attach to it.
   try {
     await proxy.start();
-    process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
+    activateRouting();
     out.appendLine(`[PROXY UP] Listening on ${proxyUrl} — all Claude Code traffic routes through us`);
     out.appendLine(`[DASHBOARD] ${dashboardUrl}`);
-    out.appendLine(`⚠️  IMPORTANT: Reload VS Code window to activate routing through the proxy`);
-    out.show(true);
     updateStatusBar(0, true);
-    vscode.window.showInformationMessage(
-      `Claude Steward: Proxy ready. Reload window to activate routing.`,
-      'Reload Now'
-    ).then(choice => {
-      if (choice === 'Reload Now') {
-        vscode.commands.executeCommand('workbench.action.reloadWindow');
-      }
-    });
+    vscode.window.showInformationMessage(`Claude Steward active — proxy on :${proxyConfig.port}, dashboard at ${dashboardUrl}`);
   } catch (err: any) {
     if ((err as any).message?.includes('already in use')) {
-      // Another window's proxy is running — attach to it
-      process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
+      isAttachedToExistingProxy = true;
+      activateRouting();
       out.appendLine(`[PROXY] Port ${proxyConfig.port} already in use — attaching to existing proxy`);
-      out.show(true);
       updateStatusBar(0, true);
-      vscode.window.showInformationMessage(
-        `Claude Steward: Attached to existing proxy on :${proxyConfig.port}`
-      );
+      vscode.window.showInformationMessage(`Claude Steward: Attached to existing proxy on :${proxyConfig.port}`);
+      startHealthCheck();
     } else {
       out.appendLine(`[PROXY ERROR] ${err.message}`);
       vscode.window.showWarningMessage(`Claude Steward: proxy failed to start — ${err.message}.`);
@@ -175,6 +221,7 @@ export async function activate(context: vscode.ExtensionContext) {
       }
       try {
         await proxy!.start();
+        activateRouting();
         updateStatusBar(stats.getSessionStats().totalSavedTokens, true);
         vscode.window.showInformationMessage(`Proxy started on port ${proxyConfig.port}.`);
       } catch (e: any) {
@@ -184,6 +231,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand('claudeOptimizer.stopProxy', async () => {
       await proxy?.stop();
+      deactivateRouting();
       updateStatusBar(stats.getSessionStats().totalSavedTokens, false);
       vscode.window.showInformationMessage('Proxy stopped.');
     }),
@@ -235,11 +283,12 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Cleanup
+  // Cleanup — VS Code calls dispose() synchronously (no await), so only sync work here.
+  // Async proxy stop is handled in deactivate() which VS Code does await.
   context.subscriptions.push({
-    dispose: async () => {
-      await proxy?.stop();
-      delete process.env['ANTHROPIC_BASE_URL'];
+    dispose: () => {
+      if (healthCheckInterval) { clearInterval(healthCheckInterval); healthCheckInterval = null; }
+      deactivateRouting();          // envColl.delete clears env from all terminals immediately
       logMonitor.dispose();
       tokenCounter.dispose();
       stats.dispose();
@@ -250,12 +299,21 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate(): Promise<void> {
-  delete process.env['ANTHROPIC_BASE_URL'];
-  try { out.appendLine(`⚠️  IMPORTANT: Reload VS Code window to stop routing through the proxy`); } catch {}
+  // healthCheckInterval and ANTHROPIC_BASE_URL are cleared by the subscription dispose above.
+  // Only async work goes here — VS Code awaits the returned promise.
   await proxy?.stop();
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+function isProxyAlive(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    const timer = setTimeout(() => { socket.destroy(); resolve(false); }, 2000);
+    socket.connect(port, '127.0.0.1', () => { clearTimeout(timer); socket.destroy(); resolve(true); });
+    socket.on('error', () => { clearTimeout(timer); resolve(false); });
+  });
+}
 
 function updateStatusBar(savedTokens: number, proxyRunning: boolean, optimizerEnabled = true): void {
   const icon = !proxyRunning ? '$(circle-slash)' : optimizerEnabled ? '$(shield)' : '$(debug-pause)';

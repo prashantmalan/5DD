@@ -54,8 +54,9 @@ export class StatsTracker {
 
   getSessionStats(): SessionStats {
     const totalRequests = this.stats.length;
-    const totalInputTokens = this.stats.reduce((s, r) => s + r.inputTokens, 0);
-    const totalOutputTokens = this.stats.reduce((s, r) => s + r.outputTokens, 0);
+    // Exclude cache hits: those tokens were never sent to Anthropic.
+    const totalInputTokens = this.stats.reduce((s, r) => s + (r.cacheHit ? 0 : r.inputTokens), 0);
+    const totalOutputTokens = this.stats.reduce((s, r) => s + (r.cacheHit ? 0 : r.outputTokens), 0);
     const totalSavedTokens = this.stats.reduce((s, r) => s + r.savedTokensByCompression + r.savedTokensByCache, 0);
     const totalCostUSD = this.stats.reduce((s, r) => s + r.costUSD, 0);
     const totalSavedCostUSD = this.stats.reduce((s, r) => s + r.savedCostUSD, 0);
