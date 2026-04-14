@@ -15,8 +15,9 @@ export interface OptimizationResult {
 
 // Max chars to keep in a single tool_result block before truncating
 const TOOL_RESULT_MAX_CHARS = 8000;
-// Token budget: if total prompt exceeds this, trim oldest messages
-const CONTEXT_TOKEN_BUDGET = 40_000;
+// Token budget: if total prompt exceeds this, trim oldest messages.
+// Claude supports 200k context — only trim when genuinely close to the limit.
+const CONTEXT_TOKEN_BUDGET = 150_000;
 // Minimum messages to always keep (never trim below this)
 const MIN_MESSAGES_TO_KEEP = 6;
 

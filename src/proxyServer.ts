@@ -331,7 +331,7 @@ export class ProxyServer {
     }
 
     // Sanitize is now done at every forward point (forwardRaw, forwardToAnthropic, forwardStreaming)
-    this.log(`[VIA PROXY → ANTHROPIC] model=${optimizedBody.model}${modelDowngraded ? ` (routed from ${originalModel})` : ''} tokens=${this.tokenCounter.countRequest(optimizedBody).prompt}`);
+    this.log(`[VIA PROXY → ANTHROPIC] model=${optimizedBody.model}${modelDowngraded ? ` (routed from ${originalModel})` : ''}`);
 
     // ── FORWARD ──────────────────────────────────────────────────────────────
     // If anything goes wrong forwarding the optimized body, fall back to the
@@ -483,25 +483,25 @@ export class ProxyServer {
         }
 
         res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-        let buffer = '';
+        let window = '';  // sliding 4KB window — avoids unbounded string growth
         let inputTokens = 0;
         let outputTokens = 0;
         let cacheReadTokens = 0;
         let cacheCreationTokens = 0;
+        let lastOutputTokens = 0;
 
         proxyRes.on('data', (chunk: Buffer) => {
           res.write(chunk);
-          buffer += chunk.toString();
+          window = (window + chunk.toString()).slice(-4096);
           // Parse usage fields from SSE events:
           //   message_start carries input_tokens and cache counts (appear once)
-          //   message_delta carries the FINAL output_tokens (use last match since
-          //   message_start also emits output_tokens: 1 which would shadow the real count)
-          const inputMatch = buffer.match(/"input_tokens":(\d+)/);
-          const outputMatches = [...buffer.matchAll(/"output_tokens":(\d+)/g)];
-          const cacheReadMatch = buffer.match(/"cache_read_input_tokens":(\d+)/);
-          const cacheCreateMatch = buffer.match(/"cache_creation_input_tokens":(\d+)/);
+          //   message_delta carries the FINAL output_tokens (use last seen value)
+          const inputMatch = window.match(/"input_tokens":(\d+)/);
+          const outputMatch = window.match(/(?:.*"output_tokens":(\d+))/s);
+          const cacheReadMatch = window.match(/"cache_read_input_tokens":(\d+)/);
+          const cacheCreateMatch = window.match(/"cache_creation_input_tokens":(\d+)/);
           if (inputMatch) inputTokens = parseInt(inputMatch[1]);
-          if (outputMatches.length > 0) outputTokens = parseInt(outputMatches[outputMatches.length - 1][1]);
+          if (outputMatch) { const v = parseInt(outputMatch[1]); if (v > lastOutputTokens) { outputTokens = v; lastOutputTokens = v; } }
           if (cacheReadMatch) cacheReadTokens = parseInt(cacheReadMatch[1]);
           if (cacheCreateMatch) cacheCreationTokens = parseInt(cacheCreateMatch[1]);
         });

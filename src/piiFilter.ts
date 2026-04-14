@@ -190,11 +190,7 @@ export class PiiFilter {
 
   private persist(entries: VaultEntry[]): void {
     if (!this.vaultPath) return;
-    try {
-      const lines = entries.map(e => JSON.stringify(e)).join('\n') + '\n';
-      fs.appendFileSync(this.vaultPath, lines, 'utf8');
-    } catch {
-      // Vault write failure is non-fatal — redaction still happens in memory
-    }
+    const lines = entries.map(e => JSON.stringify(e)).join('\n') + '\n';
+    fs.appendFile(this.vaultPath, lines, 'utf8', () => {});
   }
 }

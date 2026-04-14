@@ -136,7 +136,7 @@ export class ModelRouter {
 
     let complexity: 'simple' | 'moderate' | 'complex';
     try {
-      complexity = await withTimeout(this.classify(lastMessage, apiKey), 4000);
+      complexity = await withTimeout(this.classify(lastMessage, apiKey), 1500);
     } catch (err) {
       console.warn('[ModelRouter] Classifier skipped (timeout or error):', (err as Error).message);
       return { selectedModel: originalModel, reason: 'classifier skipped', downgraded: false };
