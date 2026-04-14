@@ -151,44 +151,59 @@ class NetworkInterceptor {
             log('[Interceptor] globalThis.fetch not available – skipping');
         }
         // ── Layer 3: https.request ────────────────────────────────────────────────
-        https.request = function (urlOrOptions, optionsOrCallback, callback) {
-            if (!isAnthropicHost(urlOrOptions)) {
-                return origHttps(urlOrOptions, optionsOrCallback, callback);
-            }
-            log(`[Interceptor/https] Redirecting request to proxy`);
-            if (typeof urlOrOptions === 'string' ||
-                urlOrOptions instanceof URL) {
-                const u = typeof urlOrOptions === 'string'
-                    ? new URL(urlOrOptions)
-                    : urlOrOptions;
-                const merged = typeof optionsOrCallback === 'object' && optionsOrCallback !== null
-                    ? { ...optionsOrCallback }
-                    : {};
-                merged.hostname = '127.0.0.1';
-                merged.host = '127.0.0.1';
-                merged.port = port;
-                merged.path =
-                    (merged.path ?? '') || u.pathname + u.search;
-                merged.method = merged.method ?? 'GET';
-                delete merged.servername;
+        try {
+            const patchedRequest = function (urlOrOptions, optionsOrCallback, callback) {
+                if (!isAnthropicHost(urlOrOptions)) {
+                    return origHttps(urlOrOptions, optionsOrCallback, callback);
+                }
+                log(`[Interceptor/https] Redirecting request to proxy`);
+                if (typeof urlOrOptions === 'string' ||
+                    urlOrOptions instanceof URL) {
+                    const u = typeof urlOrOptions === 'string'
+                        ? new URL(urlOrOptions)
+                        : urlOrOptions;
+                    const merged = typeof optionsOrCallback === 'object' && optionsOrCallback !== null
+                        ? { ...optionsOrCallback }
+                        : {};
+                    merged.hostname = '127.0.0.1';
+                    merged.host = '127.0.0.1';
+                    merged.port = port;
+                    merged.path =
+                        (merged.path ?? '') || u.pathname + u.search;
+                    merged.method = merged.method ?? 'GET';
+                    delete merged.servername;
+                    const cb = typeof optionsOrCallback === 'function'
+                        ? optionsOrCallback
+                        : callback;
+                    return http.request(merged, cb);
+                }
+                const opts = {
+                    ...urlOrOptions,
+                };
+                opts.hostname = '127.0.0.1';
+                opts.host = '127.0.0.1';
+                opts.port = port;
+                delete opts.servername;
                 const cb = typeof optionsOrCallback === 'function'
                     ? optionsOrCallback
                     : callback;
-                return http.request(merged, cb);
-            }
-            const opts = {
-                ...urlOrOptions,
+                return http.request(opts, cb);
             };
-            opts.hostname = '127.0.0.1';
-            opts.host = '127.0.0.1';
-            opts.port = port;
-            delete opts.servername;
-            const cb = typeof optionsOrCallback === 'function'
-                ? optionsOrCallback
-                : callback;
-            return http.request(opts, cb);
-        };
-        log('[Interceptor] https.request patched ✓');
+            try {
+                Object.defineProperty(https, 'request', {
+                    value: patchedRequest,
+                    writable: true,
+                    configurable: true,
+                });
+            }
+            catch {
+                https.request = patchedRequest;
+            }
+            log('[Interceptor] https.request patched ✓');
+        }
+        catch (e) {
+            log(`[Interceptor] https.request patch failed (non-fatal): ${e.message}`);
+        }
         // ── Self-test ─────────────────────────────────────────────────────────────
         this.selfTest().catch(() => { });
     }
@@ -196,7 +211,19 @@ class NetworkInterceptor {
         if (!this.active)
             return;
         this.active = false;
-        https.request = this.originalHttpsRequest;
+        try {
+            Object.defineProperty(https, 'request', {
+                value: this.originalHttpsRequest,
+                writable: true,
+                configurable: true,
+            });
+        }
+        catch {
+            try {
+                https.request = this.originalHttpsRequest;
+            }
+            catch { /* swallow */ }
+        }
         if (this.originalFetch) {
             globalThis.fetch = this.originalFetch;
         }

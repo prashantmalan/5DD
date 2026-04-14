@@ -110,7 +110,7 @@ async function activate(context) {
     context.subscriptions.push(statusBarItem);
     // Update status bar on every stat update
     stats.onUpdate(s => {
-        updateStatusBar(s.totalSavedTokens, proxy?.isRunning() ?? false);
+        updateStatusBar(s.totalSavedTokens, proxy?.isRunning() || isAttachedToExistingProxy);
     });
     // ── Proxy server ──────────────────────────────────────────────────────────
     const proxyConfig = {
@@ -119,12 +119,29 @@ async function activate(context) {
         enableCache: config.get('enableCache', true),
         enableCompression: config.get('enablePromptCompression', true),
         enableModelRouter: config.get('enableModelRouter', true),
+        enablePiiRedaction: config.get('enablePiiRedaction', true),
         apiKey: config.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
     };
     proxy = new proxyServer_1.ProxyServer(proxyConfig, cache, optimizer, router, tokenCounter, stats, (msg) => exports.out.appendLine(`[${new Date().toISOString().slice(11, 19)}] ${msg}`));
+    setStatusBarLoading();
     // ── Dashboard HTTP server ─────────────────────────────────────────────────
     const dashboardPort = config.get('dashboardPort', 8788);
     const dashboardServer = new dashboardServer_1.DashboardServer(stats, dashboardPort, () => proxy.getTraces());
+    proxy.setOnTrace(trace => dashboardServer.pushEvent('request', {
+        cacheHit: trace.cacheHit,
+        modelDowngraded: trace.originalModel !== trace.finalModel,
+        savedCostUSD: trace.savedCostUSD,
+    }));
+    let lastPiiWarnAt = 0;
+    proxy.setOnPiiDetected(types => {
+        const now = Date.now();
+        if (now - lastPiiWarnAt < 30000) {
+            return;
+        } // throttle: once per 30 s
+        lastPiiWarnAt = now;
+        vscode.window.showWarningMessage(`Claude Steward detected and masked PII in your prompt (${types.join(', ')}). ` +
+            'It was replaced with readable placeholders before being sent to Claude — your real data was not transmitted.');
+    });
     let dashboardUrl = `http://localhost:${dashboardPort}`;
     try {
         dashboardUrl = await dashboardServer.start();
@@ -211,8 +228,12 @@ async function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('claudeOptimizer.showDashboard', () => {
         vscode.env.openExternal(vscode.Uri.parse(dashboardUrl));
     }), vscode.commands.registerCommand('claudeOptimizer.toggle', () => {
-        if (!proxy?.isRunning()) {
+        if (!proxy?.isRunning() && !isAttachedToExistingProxy) {
             vscode.window.showWarningMessage('Claude Optimizer: Proxy is not running. Press F5 first.');
+            return;
+        }
+        if (isAttachedToExistingProxy && !proxy?.isRunning()) {
+            vscode.window.showInformationMessage('Claude Optimizer: Routing active via proxy owned by another window.');
             return;
         }
         const nowEnabled = proxy.toggle();
@@ -313,6 +334,10 @@ function updateStatusBar(savedTokens, proxyRunning, optimizerEnabled = true) {
     statusBarItem.backgroundColor = optimizerEnabled && proxyRunning
         ? undefined
         : new vscode.ThemeColor('statusBarItem.warningBackground');
+}
+function setStatusBarLoading() {
+    statusBarItem.text = '$(loading~spin) Claude Optimizer: Starting...';
+    statusBarItem.backgroundColor = undefined;
 }
 function registerIntegrations(builder, config, workspaceRoot) {
     // Jira

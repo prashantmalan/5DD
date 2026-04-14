@@ -50,11 +50,20 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.ProxyServer = void 0;
 const http = __importStar(require("http"));
 const https = __importStar(require("https"));
+const piiFilter_1 = require("./piiFilter");
 const ANTHROPIC_HOST = 'api.anthropic.com';
 const MAX_TRACES = 200;
 class ProxyServer {
     getTraces(n = 50) {
         return this.traces.slice(-n).reverse();
+    }
+    /** Register a callback invoked whenever a trace is recorded (for real-time SSE push). */
+    setOnTrace(cb) {
+        this.onTrace = cb;
+    }
+    /** Register a callback invoked when PII is redacted (for VS Code warning). */
+    setOnPiiDetected(cb) {
+        this.onPiiDetected = cb;
     }
     constructor(config, cache, optimizer, router, tokenCounter, stats, log) {
         this.server = null;
@@ -66,6 +75,7 @@ class ProxyServer {
         this.tokenCounter = tokenCounter;
         this.stats = stats;
         this.log = log ?? ((msg) => console.log(msg));
+        this.piiFilter = new piiFilter_1.PiiFilter({ enabled: config.enablePiiRedaction });
         // Capture original https.request NOW (before NetworkInterceptor patches it)
         this.httpsRequest = https.request.bind(https);
     }
@@ -210,15 +220,23 @@ class ProxyServer {
                     return;
                 }
             }
-            // 2. Prompt optimization
+            // 2. PII redaction
+            const piiResult = this.piiFilter.filter(optimizedBody);
+            if (piiResult.count > 0) {
+                this.log(`[pii] Redacted ${piiResult.count} value(s): ${piiResult.types.join(', ')}`);
+                optimizedBody = piiResult.body;
+                techniques.push('pii-redact');
+                this.onPiiDetected?.(piiResult.types);
+            }
+            // 3. Prompt optimization
             // Note: we track techniques but NOT token savings here — Anthropic's prompt caching
             // makes our pre-send token count unreliable vs the API-reported input_tokens.
             if (this.config.enableCompression) {
-                const result = this.optimizer.optimize(body);
+                const result = this.optimizer.optimize(optimizedBody);
                 optimizedBody = result.body;
-                techniques = result.techniques;
+                techniques.push(...result.techniques);
             }
-            // 3. Model routing
+            // 4. Model routing
             if (this.config.enableModelRouter) {
                 const reqApiKey = req.headers['x-api-key'] ||
                     req.headers['authorization']?.replace(/^Bearer\s+/i, '') ||
@@ -290,6 +308,7 @@ class ProxyServer {
                         originalModel, finalModel: optimizedBody.model, routingReason,
                         inputTokens: finalInputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
                         savedByCompression: actualSavedByCompression, techniques, streaming: true, requestStart,
+                        messagePreview: lastMsg.slice(0, 80),
                     });
                 });
             }
@@ -319,6 +338,7 @@ class ProxyServer {
                     originalModel, finalModel: optimizedBody.model, routingReason,
                     inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
                     savedByCompression: actualSavedByCompression, techniques, streaming: false, requestStart,
+                    messagePreview: lastMsg.slice(0, 80),
                 });
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(response));
@@ -603,6 +623,17 @@ class ProxyServer {
         proxyReq.end();
     }
     recordTrace(params) {
+        const routingSavings = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens);
+        const compressionSavings = (params.savedByCompression / 1000000) * this.router.inputPriceFor(params.originalModel);
+        // Only count savings from our tool: routing + compression. Anthropic's own prompt-cache
+        // discounts are not our savings — they happen regardless of this extension.
+        const savedCostUSD = routingSavings + compressionSavings;
+        if (params.originalModel !== params.finalModel) {
+            const pct = params.originalModel && params.finalModel
+                ? ` (${((routingSavings / Math.max(0.000001, routingSavings + this.router.estimateCost(params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens))) * 100).toFixed(0)}% cheaper)`
+                : '';
+            this.log(`[route] ${params.originalModel.replace('claude-', '')} → ${params.finalModel.replace('claude-', '')} | reason: ${params.routingReason} | saved $${routingSavings.toFixed(4)}${pct}`);
+        }
         const trace = {
             id: Math.random().toString(36).slice(2, 8),
             timestamp: Date.now(),
@@ -614,24 +645,26 @@ class ProxyServer {
             cacheReadTokens: params.cacheReadTokens,
             cacheCreationTokens: params.cacheCreationTokens,
             savedByCompression: params.savedByCompression,
+            savedCostUSD,
             techniques: params.techniques,
             streaming: params.streaming,
             durationMs: Date.now() - params.requestStart,
+            messagePreview: params.messagePreview ?? '',
+            cacheHit: params.techniques.includes('semantic-cache'),
         };
         this.traces.push(trace);
         if (this.traces.length > MAX_TRACES)
             this.traces.shift();
+        this.onTrace?.(trace);
     }
     buildStat(params) {
         // Cache hits don't incur API costs since they're served from proxy cache
         const costUSD = params.cacheHit ? 0 : this.router.estimateCost(params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens);
-        // Savings sources:
-        //   1. Model routing:     cheaper model selected → delta between original and final model cost
-        //   2. Compression:       tokens eliminated before sending → saved at original model's input rate
-        //   3. Anthropic cache:   cache_read_input_tokens are billed at 10% → 90% of those tokens saved
-        const anthropicCacheSavings = (params.cacheReadTokens / 1000000) * this.router.inputPriceFor(params.finalModel) * 0.90;
-        const savedCostUSD = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens) + (params.savedByCompression / 1000000) * this.router.inputPriceFor(params.originalModel)
-            + anthropicCacheSavings;
+        // Savings sources (extension-driven only — Anthropic's built-in prompt cache is excluded
+        // because it happens regardless of whether this extension is running):
+        //   1. Model routing:  cheaper model selected → delta between original and final model cost
+        //   2. Compression:    tokens eliminated before sending → saved at original model's input rate
+        const savedCostUSD = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens) + (params.savedByCompression / 1000000) * this.router.inputPriceFor(params.originalModel);
         return {
             timestamp: Date.now(),
             model: params.finalModel,

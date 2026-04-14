@@ -247,13 +247,6 @@ export class DashboardServer {
   </div>
 </div>
 
-<h2 style="font-size:0.95em;font-weight:600;margin-bottom:10px;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em">Savings by Tier</h2>
-<div class="tiers">
-  <div class="tier"><div class="tlabel">Haiku</div><div class="treqs" id="haiku_reqs">—</div><div class="tsaved" id="haiku_saved">—</div></div>
-  <div class="tier"><div class="tlabel">Sonnet</div><div class="treqs" id="sonnet_reqs">—</div><div class="tsaved" id="sonnet_saved">—</div></div>
-  <div class="tier"><div class="tlabel">Opus</div><div class="treqs" id="opus_reqs">—</div><div class="tsaved" id="opus_saved">—</div></div>
-</div>
-
 <h2 style="font-size:0.95em;font-weight:600;margin-bottom:10px;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em">Recent Requests</h2>
 <table>
   <thead><tr>
@@ -261,12 +254,10 @@ export class DashboardServer {
     <th title="Final Claude model that processed the request (may differ from what was requested)">Model</th>
     <th title="Input tokens sent to the API (after optimization)">In <span class="th-tip">tokens</span></th>
     <th title="Output tokens returned by the API">Out <span class="th-tip">tokens</span></th>
-    <th title="Why this model was chosen: pre-classify, classifier-cache, semantic-cache, passthrough">Reason</th>
-    <th title="Dollar amount saved vs. sending the original request to the original model">Saved</th>
-    <th title="Total round-trip time from proxy receiving the request to returning the response">ms</th>
+    <th title="Tokens saved by compression/cache vs original request">Saved <span class="th-tip">tokens</span></th>
     <th title="Badges: stream=streaming response, trimmed=context was compressed, →model=model was routed">Tags</th>
   </tr></thead>
-  <tbody id="tbody"><tr><td colspan="8" style="color:#8b949e;padding:16px 10px">Waiting for requests…</td></tr></tbody>
+  <tbody id="tbody"><tr><td colspan="6" style="color:#8b949e;padding:16px 10px">Waiting for requests…</td></tr></tbody>
 </table>
 
 <div class="actions">
@@ -275,7 +266,7 @@ export class DashboardServer {
   <button class="danger" onclick="clearAll()">Clear all proxy state</button>
 </div>
 
-<div class="status"><span class="dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#3fb950;margin-right:5px"></span>Auto-refreshing · Proxy on <code>localhost:8787</code> · <a href="/flow" style="color:#58a6ff;text-decoration:none">How it works →</a></div>
+<div class="status"><span class="dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#3fb950;margin-right:5px"></span>Auto-refreshing · Proxy on <code>localhost:8787</code> · <a href="#how-it-works" style="color:#58a6ff;text-decoration:none">How it works ↓</a></div>
 
 <script>
 function fmt(n) { return n >= 1000 ? (n/1000).toFixed(1)+'k' : String(Math.round(n||0)); }
@@ -351,21 +342,6 @@ function renderStats(s) {
   document.getElementById('totalReqs').textContent = 'of ' + s.totalRequests + ' requests';
   document.getElementById('downgrades').textContent = s.modelDowngrades;
 
-  const tiers = { haiku: {reqs:0,saved:0}, sonnet: {reqs:0,saved:0}, opus: {reqs:0,saved:0} };
-  (s.requests||[]).forEach(r => {
-    const m = (r.finalModel||'').toLowerCase();
-    if (m.includes('haiku')) { tiers.haiku.reqs++; tiers.haiku.saved += r.savedCostUSD||0; }
-    else if (m.includes('sonnet')) { tiers.sonnet.reqs++; tiers.sonnet.saved += r.savedCostUSD||0; }
-    else if (m.includes('opus')) { tiers.opus.reqs++; tiers.opus.saved += r.savedCostUSD||0; }
-  });
-  ['haiku','sonnet','opus'].forEach(t => {
-    const el = document.getElementById(t + '_reqs');
-    const el2 = document.getElementById(t + '_saved');
-    if (el && el2) {
-      el.textContent = tiers[t].reqs || '—';
-      el2.textContent = tiers[t].reqs > 0 ? fmtCost(tiers[t].saved) + ' saved' : '—';
-    }
-  });
 }
 
 let knownIds = new Set();
@@ -376,7 +352,7 @@ function renderTraces(traces) {
     knownIds = new Set();
     return;
   }
-  const rows = traces.slice(0, 20);
+  const rows = traces.slice(0, 15);
   tbody.innerHTML = rows.map((r, i) => {
     const isNew = !knownIds.has(r.id || i);
     const tags = [];
@@ -384,18 +360,13 @@ function renderTraces(traces) {
     if ((r.techniques||[]).includes('context-trim')) tags.push('<span class="badge r">trimmed</span>');
     if (r.streaming) tags.push('<span class="badge b">stream</span>');
     if (r.cacheHit) tags.push('<span class="badge g">cache</span>');
-    const savedCost = r.savedCostUSD > 0 ? fmtCost(r.savedCostUSD) : '—';
-    const reason = r.routingReason && r.routingReason !== 'passthrough'
-      ? '<span title="' + r.routingReason + '">' + r.routingReason.slice(0, 20) + '</span>'
-      : '<span style="color:#8b949e">pass</span>';
+    const savedTok = (r.savedByCompression||0) > 0 ? fmt(r.savedByCompression) : '—';
     return '<tr class="' + (isNew ? 'new-row' : '') + '">' +
       '<td style="color:#8b949e">' + ago(r.timestamp) + '</td>' +
       '<td><code>' + (r.finalModel||'').replace('claude-','') + '</code></td>' +
       '<td>' + fmt(r.inputTokens) + '</td>' +
       '<td>' + fmt(r.outputTokens) + '</td>' +
-      '<td style="font-size:0.78em;color:#8b949e">' + reason + '</td>' +
-      '<td style="color:#3fb950">' + savedCost + '</td>' +
-      '<td style="color:#8b949e">' + ms(r.durationMs) + '</td>' +
+      '<td style="color:#3fb950">' + savedTok + '</td>' +
       '<td>' + (tags.join('') || '—') + '</td>' +
     '</tr>';
   }).join('');
@@ -432,386 +403,60 @@ async function clearStats() { await fetch('/clear', { method:'POST' }); poll(); 
 async function clearAll()   { await fetch('/clear', { method:'POST' }); poll(); }
 
 poll();
-setInterval(poll, 4000);
+setInterval(poll, 1500);
 </script>
+
+<!-- ── How it works ──────────────────────────────────────────────────────── -->
+<div id="how-it-works" style="margin-top:40px;padding-top:24px;border-top:1px solid #21262d">
+<h2 style="font-size:0.95em;font-weight:600;margin-bottom:16px;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em">How it works</h2>
+
+<div style="display:flex;flex-direction:column;gap:2px;max-width:720px;margin-bottom:28px">
+  <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 14px;background:#161b22;border:1px solid #21262d;border-radius:8px 8px 0 0">
+    <span style="font-size:1.1em;min-width:24px">🛡️</span>
+    <div><strong style="font-size:0.85em">1 · PII Filter</strong><br><span style="font-size:0.78em;color:#8b949e">Scans the prompt for obvious personal data before it leaves VS Code.</span></div>
+  </div>
+  <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 14px;background:#161b22;border:1px solid #21262d">
+    <span style="font-size:1.1em;min-width:24px">⚡</span>
+    <div><strong style="font-size:0.85em">2 · Semantic Cache</strong><br><span style="font-size:0.78em;color:#8b949e">Checks if a very similar question was already answered (cosine ≥ 0.92). If yes, returns the cached response instantly — no API call.</span> <span style="font-size:0.73em;color:#3fb950;font-weight:600">Up to 100% savings</span></div>
+  </div>
+  <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 14px;background:#161b22;border:1px solid #21262d">
+    <span style="font-size:1.1em;min-width:24px">✂️</span>
+    <div><strong style="font-size:0.85em">3 · Prompt Optimizer</strong><br><span style="font-size:0.78em;color:#8b949e">Strips filler phrases, collapses whitespace, trims context overflow — without changing meaning.</span> <span style="font-size:0.73em;color:#3fb950;font-weight:600">5–20% token reduction</span></div>
+  </div>
+  <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 14px;background:#161b22;border:1px solid #21262d">
+    <span style="font-size:1.1em;min-width:24px">🔀</span>
+    <div><strong style="font-size:0.85em">4 · Model Router</strong><br><span style="font-size:0.78em;color:#8b949e">Classifies request complexity with a fast Haiku call. Simple queries route to a cheaper tier; complex or code-heavy ones go to the model you requested.</span> <span style="font-size:0.73em;color:#58a6ff;font-weight:600">Up to 10× cheaper</span></div>
+  </div>
+  <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 14px;background:#161b22;border:1px solid #21262d">
+    <span style="font-size:1.1em;min-width:24px">🤖</span>
+    <div><strong style="font-size:0.85em">5 · Claude API</strong><br><span style="font-size:0.78em;color:#8b949e">The optimised request is forwarded to Anthropic. Streaming responses pass through token-by-token.</span></div>
+  </div>
+  <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 14px;background:#161b22;border:1px solid #21262d;border-radius:0 0 8px 8px">
+    <span style="font-size:1.1em;min-width:24px">📬</span>
+    <div><strong style="font-size:0.85em">6 · Response → VS Code</strong><br><span style="font-size:0.78em;color:#8b949e">Response returned to Claude Code. Token counts, cost, model, and savings recorded; dashboard updates in real time via SSE.</span></div>
+  </div>
+</div>
+
+<h2 style="font-size:0.95em;font-weight:600;margin-bottom:12px;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em">Column guide</h2>
+<div style="background:#161b22;border:1px solid #21262d;border-radius:8px;overflow:hidden;margin-bottom:32px">
+  <div style="display:grid;grid-template-columns:110px 1fr;gap:0">
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Tokens Saved</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Cumulative tokens not sent to the API — from prompt compression and cache hits. % = fraction saved vs. what would have been sent without the extension.</div>
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Cost Saved</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Dollar savings from our routing + compression. Does not include Anthropic's own prompt-cache discounts.</div>
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Cache Hits</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Requests answered from our semantic cache — no API call made.</div>
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Model Routes</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Requests redirected to a cheaper model tier by the router.</div>
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Saved (table)</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Per-request tokens saved by our compression. — means no compression was applied.</div>
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600">Tags</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e"><code style="background:#21262d;padding:1px 4px;border-radius:3px">stream</code> streaming · <code style="background:#21262d;padding:1px 4px;border-radius:3px">trimmed</code> context compressed · <code style="background:#21262d;padding:1px 4px;border-radius:3px">→model</code> routed · <code style="background:#21262d;padding:1px 4px;border-radius:3px">cache</code> semantic cache hit</div>
+  </div>
+</div>
+</div>
 </body>
 </html>`;
   }
 
-  // ── /flow page ─────────────────────────────────────────────────────────────
+  // ── /flow page — redirect to main dashboard ────────────────────────────────
   private flowHtml(): string {
     return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Claude Steward — How it Works</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #e6edf3; padding: 24px; min-height: 100vh; }
-  h1 { font-size: 1.3em; font-weight: 600; margin-bottom: 4px; }
-  .sub { font-size: 0.8em; color: #8b949e; margin-bottom: 16px; }
-  nav { display: flex; gap: 10px; margin-bottom: 28px; }
-  nav a { color: #58a6ff; font-size: 0.85em; text-decoration: none; padding: 5px 12px; border: 1px solid #21262d; border-radius: 6px; background: #161b22; }
-  nav a:hover { background: #21262d; }
-  nav a.active { border-color: #58a6ff; }
-
-  /* ── 3D pipeline diagram ── */
-  .pipeline-scene { perspective: 1100px; perspective-origin: 50% 40%; margin-bottom: 36px; }
-  .pipeline {
-    display: flex; flex-direction: column; align-items: center; gap: 0;
-    transform-style: preserve-3d;
-    transform: rotateX(4deg);
-  }
-  .stage { display: flex; align-items: stretch; width: 100%; max-width: 780px; gap: 0; transform-style: preserve-3d; }
-  .stage-box {
-    flex: 1; background: #161b22; border: 1.5px solid #21262d; border-radius: 10px;
-    padding: 16px 20px; display: flex; align-items: flex-start; gap: 14px;
-    transition: border-color 0.3s, box-shadow 0.3s, transform 0.3s;
-    cursor: default;
-    transform-style: preserve-3d;
-    box-shadow: 0 6px 24px rgba(0,0,0,0.4), 0 1px 0 #30363d inset;
-  }
-  .stage-box:hover {
-    transform: translateZ(8px) translateY(-2px);
-    border-color: #58a6ff;
-    box-shadow: 0 12px 32px rgba(0,0,0,0.5), 0 0 0 1px #58a6ff44;
-  }
-  .stage-box.active {
-    border-color: #3fb950;
-    transform: translateZ(12px) translateY(-2px);
-    box-shadow: 0 14px 36px rgba(63,185,80,0.25), 0 0 0 2px rgba(63,185,80,0.3);
-  }
-  .stage-icon { font-size: 1.7em; min-width: 36px; text-align: center; padding-top: 2px; }
-  .stage-body { flex: 1; }
-  .stage-title { font-size: 0.95em; font-weight: 700; margin-bottom: 4px; }
-  .stage-desc  { font-size: 0.8em; color: #8b949e; line-height: 1.55; }
-  .stage-saving { display: inline-block; margin-top: 7px; font-size: 0.74em; padding: 2px 8px; border-radius: 10px; background: #0d2b13; color: #3fb950; font-weight: 600; }
-  .stage-saving.blue { background: #0d1b2e; color: #58a6ff; }
-  .stage-saving.orange { background: #2b1a00; color: #e3b341; }
-
-  .connector { display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 780px; position: relative; height: 36px; }
-  .connector-line { width: 2px; height: 36px; background: #21262d; position: relative; }
-  .connector-arrow { position: absolute; bottom: -1px; left: 50%; transform: translateX(-50%); color: #30363d; font-size: 1em; }
-  .connector-label { position: absolute; right: 0; top: 8px; font-size: 0.7em; color: #8b949e; white-space: nowrap; }
-  .connector.active .connector-line { background: linear-gradient(to bottom, #3fb950, #3fb950); animation: flowdown 0.5s ease-in-out; }
-  .connector.active .connector-arrow { color: #3fb950; }
-
-  @keyframes flowdown {
-    from { background: linear-gradient(to bottom, transparent, transparent); }
-    to   { background: linear-gradient(to bottom, #3fb950, #3fb950); }
-  }
-
-  /* ── animated packet ── */
-  .packet-wrapper { position: relative; overflow: visible; }
-  .packet {
-    display: none;
-    position: absolute;
-    left: 50%; top: 0;
-    transform: translateX(-50%);
-    width: 10px; height: 10px;
-    border-radius: 50%;
-    background: #3fb950;
-    box-shadow: 0 0 8px #3fb950;
-    z-index: 10;
-    pointer-events: none;
-  }
-  .packet.running {
-    display: block;
-    animation: traveldown 0.45s linear forwards;
-  }
-  @keyframes traveldown { from{top:0;opacity:1} to{top:100%;opacity:0.6} }
-
-  /* ── bypass paths ── */
-  .bypass-wrap { display: flex; align-items: center; width: 100%; max-width: 780px; gap: 8px; height: 0; overflow: visible; }
-  .bypass-line { flex: 0 0 auto; height: 2px; background: #e3b341; opacity: 0; transition: opacity 0.3s; }
-
-  /* ── legend ── */
-  .legend { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
-  .leg { display: flex; align-items: center; gap: 6px; font-size: 0.78em; color: #8b949e; }
-  .leg-dot { width: 10px; height: 10px; border-radius: 50%; }
-
-  /* ── detail cards ── */
-  .detail-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 28px; }
-  .detail-card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 14px 16px; }
-  .detail-card h3 { font-size: 0.82em; font-weight: 600; margin-bottom: 8px; color: #e6edf3; }
-  .detail-card p { font-size: 0.75em; color: #8b949e; line-height: 1.6; }
-  .detail-card code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
-
-  /* ── dashboard column glossary ── */
-  .glossary { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px 20px; margin-bottom: 28px; }
-  .glossary h2 { font-size: 0.9em; font-weight: 600; margin-bottom: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
-  .gl-row { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px solid #21262d; font-size: 0.8em; }
-  .gl-row:last-child { border-bottom: none; }
-  .gl-col { min-width: 110px; font-weight: 600; color: #e6edf3; }
-  .gl-desc { color: #8b949e; line-height: 1.5; }
-
-  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; animation: blink 1.5s infinite; display: inline-block; margin-right: 5px; }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-  button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 7px 16px; border-radius: 6px; cursor: pointer; font-size: 0.85em; }
-  button:hover { background: #30363d; }
-
-  @media (max-width: 700px) { .detail-grid { grid-template-columns: 1fr; } }
-</style>
-</head>
-<body>
-<h1>Claude Steward — How it Works</h1>
-<div class="sub">Animated pipeline · every Claude Code request flows through these stages</div>
-
-<nav>
-  <a href="/">Dashboard</a>
-  <a href="/flow" class="active">How it works</a>
-</nav>
-
-<!-- Legend -->
-<div class="legend">
-  <div class="leg"><div class="leg-dot" style="background:#3fb950"></div>Normal flow</div>
-  <div class="leg"><div class="leg-dot" style="background:#e3b341"></div>Cache shortcut (skips API)</div>
-  <div class="leg"><div class="leg-dot" style="background:#58a6ff"></div>Model downgrade path</div>
-  <div class="leg"><span class="live-dot"></span>Live replay from last request</div>
-</div>
-
-<!-- 3D Pipeline diagram -->
-<div class="pipeline-scene">
-<div class="pipeline" id="pipeline">
-
-  <div class="stage">
-    <div class="stage-box" id="s0">
-      <div class="stage-icon">💻</div>
-      <div class="stage-body">
-        <div class="stage-title">1 · VS Code / Claude Code</div>
-        <div class="stage-desc">You send a message in Claude Code. The extension intercepts the outgoing HTTPS request before it reaches Anthropic — using Node's <code>http</code>/<code>https</code> module hooks and a local proxy on <code>localhost:8787</code>.</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="connector packet-wrapper" id="c01">
-    <div class="connector-line"></div>
-    <div class="connector-arrow">▼</div>
-    <div class="packet" id="pkt0"></div>
-  </div>
-
-  <div class="stage">
-    <div class="stage-box" id="s1">
-      <div class="stage-icon">🔒</div>
-      <div class="stage-body">
-        <div class="stage-title">2 · PII Filter</div>
-        <div class="stage-desc">Scans the request body for personally identifiable information — emails, phone numbers, API keys, credit card numbers — and replaces them with readable placeholders like <code>‹EMAIL_ADDRESS_a3f2›</code> before the request is forwarded. Your real values are never sent to Claude. A VS Code warning appears when any redaction occurs.</div>
-        <span class="stage-saving orange">Privacy guard</span>
-      </div>
-    </div>
-  </div>
-
-  <div class="connector packet-wrapper" id="c12">
-    <div class="connector-line"></div>
-    <div class="connector-arrow">▼</div>
-    <div class="packet" id="pkt1"></div>
-  </div>
-
-  <div class="stage">
-    <div class="stage-box" id="s2">
-      <div class="stage-icon">⚡</div>
-      <div class="stage-body">
-        <div class="stage-title">3 · Semantic Cache</div>
-        <div class="stage-desc">Computes an embedding of the last user message and checks if a semantically similar question was already answered. If a match is found (cosine similarity ≥ 0.92) the cached response is returned <em>instantly</em> — no API call, no cost.</div>
-        <span class="stage-saving">Up to 100% savings on repeated questions</span>
-      </div>
-    </div>
-  </div>
-
-  <div class="connector packet-wrapper" id="c23">
-    <div class="connector-line"></div>
-    <div class="connector-arrow">▼</div>
-    <div class="packet" id="pkt2"></div>
-    <div class="connector-label" id="clabel23" style="color:#e3b341;display:none">⚡ Cache hit — stops here</div>
-  </div>
-
-  <div class="stage">
-    <div class="stage-box" id="s3">
-      <div class="stage-icon">✂️</div>
-      <div class="stage-body">
-        <div class="stage-title">4 · Prompt Optimizer</div>
-        <div class="stage-desc">Removes filler phrases (<em>"please note that…"</em>), collapses whitespace, strips redundant politeness markers, and trims context window overflow. Saves tokens without changing the semantic meaning of your prompt.</div>
-        <span class="stage-saving">Typically 5–20% token reduction</span>
-      </div>
-    </div>
-  </div>
-
-  <div class="connector packet-wrapper" id="c34">
-    <div class="connector-line"></div>
-    <div class="connector-arrow">▼</div>
-    <div class="packet" id="pkt3"></div>
-  </div>
-
-  <div class="stage">
-    <div class="stage-box" id="s4">
-      <div class="stage-icon">🔀</div>
-      <div class="stage-body">
-        <div class="stage-title">5 · Model Router</div>
-        <div class="stage-desc">Classifies the complexity of your request using a fast Haiku call. Simple questions (factual lookups, short explanations) are routed to a cheaper tier; complex or code-heavy requests go to the model you requested. The routing decision is cached so subsequent similar messages skip the classifier call.</div>
-        <span class="stage-saving blue">Up to 10× cheaper for simple queries</span>
-      </div>
-    </div>
-  </div>
-
-  <div class="connector packet-wrapper" id="c45">
-    <div class="connector-line"></div>
-    <div class="connector-arrow">▼</div>
-    <div class="packet" id="pkt4"></div>
-  </div>
-
-  <div class="stage">
-    <div class="stage-box" id="s5">
-      <div class="stage-icon">🤖</div>
-      <div class="stage-body">
-        <div class="stage-title">6 · Claude API</div>
-        <div class="stage-desc">The optimised, possibly-rerouted request is forwarded to Anthropic. Streaming responses are passed through token-by-token. Token usage from the response headers is recorded for the dashboard.</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="connector packet-wrapper" id="c56" style="transform: rotate(180deg)">
-    <div class="connector-line"></div>
-    <div class="connector-arrow">▼</div>
-    <div class="packet" id="pkt5"></div>
-  </div>
-
-  <div class="stage">
-    <div class="stage-box" id="s6">
-      <div class="stage-icon">📬</div>
-      <div class="stage-body">
-        <div class="stage-title">7 · Response → VS Code</div>
-        <div class="stage-desc">The response (or cached answer) is returned to Claude Code. Stats are recorded: tokens, cost, model used, savings achieved, duration. The dashboard updates in real time via SSE.</div>
-      </div>
-    </div>
-  </div>
-
-</div><!-- /pipeline -->
-</div><!-- /pipeline-scene -->
-
-<!-- Play controls -->
-<div style="margin-bottom:28px;display:flex;gap:10px;align-items:center">
-  <button onclick="playNormal()">▶ Simulate normal request</button>
-  <button onclick="playCacheHit()">⚡ Simulate cache hit</button>
-  <button onclick="playDowngrade()">🔀 Simulate model downgrade</button>
-</div>
-
-<!-- Dashboard column glossary -->
-<div class="glossary">
-  <h2>Dashboard column guide</h2>
-  <div class="gl-row"><div class="gl-col">Tokens Saved</div><div class="gl-desc">Cumulative tokens not sent to the API — from prompt compression and semantic cache hits combined. The % is the fraction saved vs. total tokens that would have been sent without the extension.</div></div>
-  <div class="gl-row"><div class="gl-col">Cost Saved</div><div class="gl-desc">Dollar amount saved this session. Calculated as <code>(originalTokens − actualTokens) × inputPrice + cacheHits × fullCost</code>. The "Total spent" hint shows what you actually paid.</div></div>
-  <div class="gl-row"><div class="gl-col">Cache Hits</div><div class="gl-desc">Number of requests answered from the semantic cache without an API call. "of N requests" gives the hit rate.</div></div>
-  <div class="gl-row"><div class="gl-col">Model Routes</div><div class="gl-desc">How many requests were redirected to a cheaper model tier (e.g. Opus → Haiku). The router only downgrades when it is confident the task is simple enough.</div></div>
-  <div class="gl-row"><div class="gl-col">In (tokens)</div><div class="gl-desc">Input tokens actually sent to the API after optimization. Does not include tokens saved by compression.</div></div>
-  <div class="gl-row"><div class="gl-col">Out (tokens)</div><div class="gl-desc">Output tokens returned by Claude in the response.</div></div>
-  <div class="gl-row"><div class="gl-col">Reason</div><div class="gl-desc"><code>pre-classify</code> = heuristic match (no classifier call needed) · <code>classifier-cache</code> = same question classified before · <code>classifier</code> = Haiku classification call made · <code>pass</code> = passed through unchanged.</div></div>
-  <div class="gl-row"><div class="gl-col">Saved</div><div class="gl-desc">Per-request dollar saving vs. sending the original prompt to the original model at full price.</div></div>
-  <div class="gl-row"><div class="gl-col">ms</div><div class="gl-desc">Total proxy round-trip in milliseconds — from the moment the request arrived at the proxy to the last byte of the response being sent back.</div></div>
-  <div class="gl-row"><div class="gl-col">Tags</div><div class="gl-desc"><code>stream</code> = streaming response · <code>trimmed</code> = context window was compressed · <code>→model</code> = routed to a different model · <code>cache</code> = served from semantic cache.</div></div>
-</div>
-
-<!-- Detail cards -->
-<div class="detail-grid">
-  <div class="detail-card">
-    <h3>Why a local proxy?</h3>
-    <p>Claude Code sends HTTPS requests directly to <code>api.anthropic.com</code>. The extension patches Node's <code>https.request</code> and <code>undici</code> fetch hooks to transparently redirect those requests through <code>localhost:8787</code> first — no configuration needed, no code changes.</p>
-  </div>
-  <div class="detail-card">
-    <h3>What is never stored?</h3>
-    <p>Prompt content, response content, file contents, or any user data is never stored. Only token counts, model names, costs, timestamps, and a short message preview (first 80 chars) is kept — all in memory, cleared on VS Code restart.</p>
-  </div>
-  <div class="detail-card">
-    <h3>Semantic cache accuracy</h3>
-    <p>The cache uses cosine similarity on a lightweight local embedding (no API call). The 0.92 threshold is tuned to be conservative — it only returns a cached answer when the question is genuinely very similar, not just topically related.</p>
-  </div>
-  <div class="detail-card">
-    <h3>Model routing safety</h3>
-    <p>The router never upgrades your model (it can only downgrade to save cost). If it is uncertain, it passes through unchanged. You can disable routing entirely in extension settings to always use your requested model.</p>
-  </div>
-  <div class="detail-card">
-    <h3>Savings by tier</h3>
-    <p>The dashboard breaks down requests by model tier (Haiku / Sonnet / Opus) so you can see how much of your usage was naturally routed to cheaper tiers and how much was actively downgraded by the router.</p>
-  </div>
-  <div class="detail-card">
-    <h3>Real-time updates</h3>
-    <p>The dashboard uses Server-Sent Events (<code>/events</code>) so cards and the mini flow strip animate the moment a request is processed — no need to wait for the 4-second poll cycle.</p>
-  </div>
-</div>
-
-<div style="font-size:0.75em;color:#8b949e;margin-bottom:24px">
-  <span class="live-dot"></span>Live event feed active · <a href="/" style="color:#58a6ff;text-decoration:none">← Back to dashboard</a>
-</div>
-
-<script>
-// ── Stage IDs in order ───────────────────────────────────────────────────────
-const STAGES     = ['s0','s1','s2','s3','s4','s5','s6'];
-const CONNECTORS = ['c01','c12','c23','c34','c45','c56'];
-const PACKETS    = ['pkt0','pkt1','pkt2','pkt3','pkt4','pkt5'];
-
-function clearAll() {
-  STAGES.forEach(id => document.getElementById(id)?.classList.remove('active'));
-  CONNECTORS.forEach(id => document.getElementById(id)?.classList.remove('active'));
-  PACKETS.forEach(id => document.getElementById(id)?.classList.remove('running'));
-  const lbl = document.getElementById('clabel23');
-  if (lbl) lbl.style.display = 'none';
-}
-
-function animateTo(stopAfterStage, isCacheHit) {
-  clearAll();
-  let step = 0;
-
-  function tick() {
-    if (step >= STAGES.length || step > stopAfterStage) return;
-
-    // Light up current stage
-    document.getElementById(STAGES[step])?.classList.add('active');
-
-    // Animate packet in connector leading to next
-    if (step < PACKETS.length) {
-      const pkt = document.getElementById(PACKETS[step]);
-      if (pkt) {
-        pkt.classList.remove('running');
-        void pkt.offsetWidth; // reflow
-        pkt.classList.add('running');
-      }
-      document.getElementById(CONNECTORS[step])?.classList.add('active');
-    }
-
-    if (step === 2 && isCacheHit) {
-      const lbl = document.getElementById('clabel23');
-      if (lbl) { lbl.style.display = 'block'; }
-    }
-
-    step++;
-    if (step <= stopAfterStage) setTimeout(tick, 420);
-  }
-  tick();
-}
-
-function playNormal()    { animateTo(6, false); }
-function playCacheHit()  { animateTo(2, true);  }
-function playDowngrade() { animateTo(6, false); }
-
-// ── SSE live replay ──────────────────────────────────────────────────────────
-function connectSSE() {
-  const es = new EventSource('/events');
-  es.onmessage = e => {
-    try {
-      const d = JSON.parse(e.data);
-      if (d.type === 'request') {
-        animateTo(d.cacheHit ? 2 : 6, d.cacheHit);
-      }
-    } catch {}
-  };
-  es.onerror = () => setTimeout(connectSSE, 3000);
-}
-connectSSE();
-
-// Auto-demo on load if no SSE event in 3 seconds
-let demoed = false;
-setTimeout(() => { if (!demoed) { playNormal(); demoed = true; } }, 800);
-</script>
-</body>
-</html>`;
+<html><head><meta http-equiv="refresh" content="0;url=/#how-it-works"></head>
+<body><a href="/#how-it-works">Redirecting…</a></body></html>`;
   }
 }

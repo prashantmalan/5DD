@@ -9,5 +9,4 @@ out/
 *.vsix
 
 # Local env
-set_env.bat
 .env

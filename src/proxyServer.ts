@@ -707,9 +707,9 @@ export class ProxyServer {
     );
     const compressionSavings =
       (params.savedByCompression / 1_000_000) * this.router.inputPriceFor(params.originalModel);
-    const anthropicCacheSavings =
-      (params.cacheReadTokens / 1_000_000) * this.router.inputPriceFor(params.finalModel) * 0.90;
-    const savedCostUSD = routingSavings + compressionSavings + anthropicCacheSavings;
+    // Only count savings from our tool: routing + compression. Anthropic's own prompt-cache
+    // discounts are not our savings — they happen regardless of this extension.
+    const savedCostUSD = routingSavings + compressionSavings;
 
     if (params.originalModel !== params.finalModel) {
       const pct = params.originalModel && params.finalModel
@@ -761,18 +761,15 @@ export class ProxyServer {
       params.cacheReadTokens, params.cacheCreationTokens,
     );
 
-    // Savings sources:
-    //   1. Model routing:     cheaper model selected → delta between original and final model cost
-    //   2. Compression:       tokens eliminated before sending → saved at original model's input rate
-    //   3. Anthropic cache:   cache_read_input_tokens are billed at 10% → 90% of those tokens saved
-    const anthropicCacheSavings =
-      (params.cacheReadTokens / 1_000_000) * this.router.inputPriceFor(params.finalModel) * 0.90;
+    // Savings sources (extension-driven only — Anthropic's built-in prompt cache is excluded
+    // because it happens regardless of whether this extension is running):
+    //   1. Model routing:  cheaper model selected → delta between original and final model cost
+    //   2. Compression:    tokens eliminated before sending → saved at original model's input rate
     const savedCostUSD = this.router.estimateSavings(
       params.originalModel, params.finalModel,
       params.inputTokens, params.outputTokens,
       params.cacheReadTokens, params.cacheCreationTokens,
-    ) + (params.savedByCompression / 1_000_000) * this.router.inputPriceFor(params.originalModel)
-      + anthropicCacheSavings;
+    ) + (params.savedByCompression / 1_000_000) * this.router.inputPriceFor(params.originalModel);
 
     return {
       timestamp: Date.now(),

@@ -101,12 +101,12 @@ export class DashboardPanel {
 
 <div class="grid">
   <div class="card">
-    <div class="label">Tokens Saved</div>
+    <div class="label">Tokens Saved by Extension</div>
     <div class="value" id="savedTokens">0</div>
-    <div class="sub" id="savingsPct">0% savings</div>
+    <div class="sub" id="savingsPct">routing + compression only</div>
   </div>
   <div class="card">
-    <div class="label">Cost Saved</div>
+    <div class="label">Cost Saved by Extension</div>
     <div class="value" id="savedCost">$0.00</div>
     <div class="sub" id="totalCost">Total cost: $0.00</div>
   </div>
@@ -153,7 +153,7 @@ function timeAgo(ts) {
 
 function render(s) {
   document.getElementById('savedTokens').textContent = fmt(s.totalSavedTokens);
-  document.getElementById('savingsPct').textContent = s.avgSavingsPct.toFixed(1) + '% savings';
+  document.getElementById('savingsPct').textContent = 'routing + compression only';
   document.getElementById('savedCost').textContent = fmtCost(s.totalSavedCostUSD);
   document.getElementById('totalCost').textContent = 'Total cost: ' + fmtCost(s.totalCostUSD);
   document.getElementById('cacheHits').textContent = s.cacheHits;
