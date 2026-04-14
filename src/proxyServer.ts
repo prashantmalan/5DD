@@ -41,6 +41,7 @@ export interface MessageTrace {
   streaming: boolean;
   durationMs: number;
   messagePreview: string; // first 80 chars of last user message — for downloaded logs only
+  cacheHit?: boolean;    // true if served from semantic cache
 }
 
 export interface ProxyConfig {
@@ -67,9 +68,21 @@ export class ProxyServer {
   // Captured before NetworkInterceptor patches https.request — used for all
   // outgoing Anthropic forwarding so we never loop back into ourselves.
   private readonly httpsRequest: typeof https.request;
+  private onTrace?: (trace: MessageTrace) => void;
+  private onPiiDetected?: (types: string[]) => void;
 
   getTraces(n = 50): MessageTrace[] {
     return this.traces.slice(-n).reverse();
+  }
+
+  /** Register a callback invoked whenever a trace is recorded (for real-time SSE push). */
+  setOnTrace(cb: (trace: MessageTrace) => void): void {
+    this.onTrace = cb;
+  }
+
+  /** Register a callback invoked when PII is redacted (for VS Code warning). */
+  setOnPiiDetected(cb: (types: string[]) => void): void {
+    this.onPiiDetected = cb;
   }
 
   constructor(
@@ -254,6 +267,7 @@ export class ProxyServer {
         this.log(`[pii] Redacted ${piiResult.count} value(s): ${piiResult.types.join(', ')}`);
         optimizedBody = piiResult.body;
         techniques.push('pii-redact');
+        this.onPiiDetected?.(piiResult.types);
       }
 
       // 3. Prompt optimization
@@ -720,9 +734,11 @@ export class ProxyServer {
       streaming: params.streaming,
       durationMs: Date.now() - params.requestStart,
       messagePreview: params.messagePreview ?? '',
+      cacheHit: params.techniques.includes('semantic-cache'),
     };
     this.traces.push(trace);
     if (this.traces.length > MAX_TRACES) this.traces.shift();
+    this.onTrace?.(trace);
   }
 
   private buildStat(params: {

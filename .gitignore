@@ -1,0 +1,13 @@
+# PII vault — contains redacted values, never commit
+pii-vault.jsonl
+**/pii-vault.jsonl
+
+# Build output
+out/
+
+# VSIX packages
+*.vsix
+
+# Local env
+set_env.bat
+.env

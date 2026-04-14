@@ -112,6 +112,21 @@ export async function activate(context: vscode.ExtensionContext) {
   // ── Dashboard HTTP server ─────────────────────────────────────────────────
   const dashboardPort = config.get<number>('dashboardPort', 8788);
   const dashboardServer = new DashboardServer(stats, dashboardPort, () => proxy!.getTraces());
+  proxy.setOnTrace(trace => dashboardServer.pushEvent('request', {
+    cacheHit: trace.cacheHit,
+    modelDowngraded: trace.originalModel !== trace.finalModel,
+    savedCostUSD: trace.savedCostUSD,
+  }));
+  let lastPiiWarnAt = 0;
+  proxy.setOnPiiDetected(types => {
+    const now = Date.now();
+    if (now - lastPiiWarnAt < 30_000) { return; } // throttle: once per 30 s
+    lastPiiWarnAt = now;
+    vscode.window.showWarningMessage(
+      `Claude Steward detected and masked PII in your prompt (${types.join(', ')}). ` +
+      'It was replaced with readable placeholders before being sent to Claude — your real data was not transmitted.',
+    );
+  });
   let dashboardUrl = `http://localhost:${dashboardPort}`;
   try {
     dashboardUrl = await dashboardServer.start();

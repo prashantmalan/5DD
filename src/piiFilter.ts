@@ -79,9 +79,20 @@ function shortId(): string {
   return Math.random().toString(36).slice(2, 6);
 }
 
+// Human-readable label per PII type — shown to Claude instead of raw value
+const TYPE_LABEL: Record<string, string> = {
+  'api-key':      'API_KEY',
+  'bearer-token': 'BEARER_TOKEN',
+  'email':        'EMAIL_ADDRESS',
+  'phone':        'PHONE_NUMBER',
+  'ipv4':         'IP_ADDRESS',
+  'credit-card':  'CARD_NUMBER',
+};
+
 function makeToken(type: string, original: string, vault: VaultEntry[]): string {
   const id = shortId();
-  const redacted = `[PII:${type}:${id}]`;
+  const label = TYPE_LABEL[type] ?? type.toUpperCase();
+  const redacted = `‹${label}_${id}›`;
   vault.push({ id, type, original, redacted, timestamp: Date.now() });
   return redacted;
 }
