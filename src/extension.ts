@@ -11,6 +11,7 @@
 
 import * as vscode from 'vscode';
 import * as net from 'net';
+import { exec } from 'child_process';
 import { TokenCounter } from './tokenCounter';
 import { PromptOptimizer } from './promptOptimizer';
 import { SemanticCache } from './semanticCache';
@@ -144,14 +145,30 @@ export async function activate(context: vscode.ExtensionContext) {
 
   interceptor = new NetworkInterceptor(proxyConfig.port);
 
+  function setUserEnvVar(value: string | null) {
+    // Use setx to persist at Windows user level — same as set_env.bat but automatic.
+    // setx writes to HKCU; no admin required. New processes pick it up immediately.
+    if (process.platform === 'win32') {
+      const cmd = value
+        ? `setx ANTHROPIC_BASE_URL "${value}"`
+        : `reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f`;
+      exec(cmd, (err) => {
+        if (err) out.appendLine(`[ENV] setx failed: ${err.message}`);
+        else out.appendLine(`[ENV] ANTHROPIC_BASE_URL ${value ? `set to ${value}` : 'cleared'} (user env)`);
+      });
+    }
+  }
+
   function activateRouting() {
     process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
     envColl.replace('ANTHROPIC_BASE_URL', proxyUrl);
+    setUserEnvVar(proxyUrl);
     interceptor!.install();
   }
   function deactivateRouting() {
     delete process.env['ANTHROPIC_BASE_URL'];
     envColl.delete('ANTHROPIC_BASE_URL');
+    setUserEnvVar(null);
     interceptor!.uninstall();
   }
 
