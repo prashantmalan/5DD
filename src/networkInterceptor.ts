@@ -141,59 +141,73 @@ export class NetworkInterceptor {
     }
 
     // ── Layer 3: https.request ────────────────────────────────────────────────
-    (https as any).request = function (
-      urlOrOptions: string | URL | https.RequestOptions,
-      optionsOrCallback?:
-        | https.RequestOptions
-        | ((res: http.IncomingMessage) => void),
-      callback?: (res: http.IncomingMessage) => void,
-    ): http.ClientRequest {
-      if (!isAnthropicHost(urlOrOptions)) {
-        return (origHttps as any)(urlOrOptions, optionsOrCallback, callback);
-      }
+    try {
+      const patchedRequest = function (
+        urlOrOptions: string | URL | https.RequestOptions,
+        optionsOrCallback?:
+          | https.RequestOptions
+          | ((res: http.IncomingMessage) => void),
+        callback?: (res: http.IncomingMessage) => void,
+      ): http.ClientRequest {
+        if (!isAnthropicHost(urlOrOptions)) {
+          return (origHttps as any)(urlOrOptions, optionsOrCallback, callback);
+        }
 
-      log(`[Interceptor/https] Redirecting request to proxy`);
+        log(`[Interceptor/https] Redirecting request to proxy`);
 
-      if (
-        typeof urlOrOptions === 'string' ||
-        urlOrOptions instanceof URL
-      ) {
-        const u =
-          typeof urlOrOptions === 'string'
-            ? new URL(urlOrOptions)
-            : urlOrOptions;
-        const merged: http.RequestOptions =
-          typeof optionsOrCallback === 'object' && optionsOrCallback !== null
-            ? { ...(optionsOrCallback as http.RequestOptions) }
-            : {};
-        merged.hostname = '127.0.0.1';
-        merged.host = '127.0.0.1';
-        merged.port = port;
-        merged.path =
-          (merged.path ?? '') || u.pathname + u.search;
-        merged.method = merged.method ?? 'GET';
-        delete (merged as any).servername;
+        if (
+          typeof urlOrOptions === 'string' ||
+          urlOrOptions instanceof URL
+        ) {
+          const u =
+            typeof urlOrOptions === 'string'
+              ? new URL(urlOrOptions)
+              : urlOrOptions;
+          const merged: http.RequestOptions =
+            typeof optionsOrCallback === 'object' && optionsOrCallback !== null
+              ? { ...(optionsOrCallback as http.RequestOptions) }
+              : {};
+          merged.hostname = '127.0.0.1';
+          merged.host = '127.0.0.1';
+          merged.port = port;
+          merged.path =
+            (merged.path ?? '') || u.pathname + u.search;
+          merged.method = merged.method ?? 'GET';
+          delete (merged as any).servername;
+          const cb =
+            typeof optionsOrCallback === 'function'
+              ? optionsOrCallback
+              : callback;
+          return http.request(merged, cb);
+        }
+
+        const opts: http.RequestOptions = {
+          ...(urlOrOptions as https.RequestOptions),
+        };
+        opts.hostname = '127.0.0.1';
+        opts.host = '127.0.0.1';
+        opts.port = port;
+        delete (opts as any).servername;
         const cb =
           typeof optionsOrCallback === 'function'
             ? optionsOrCallback
             : callback;
-        return http.request(merged, cb);
-      }
-
-      const opts: http.RequestOptions = {
-        ...(urlOrOptions as https.RequestOptions),
+        return http.request(opts, cb);
       };
-      opts.hostname = '127.0.0.1';
-      opts.host = '127.0.0.1';
-      opts.port = port;
-      delete (opts as any).servername;
-      const cb =
-        typeof optionsOrCallback === 'function'
-          ? optionsOrCallback
-          : callback;
-      return http.request(opts, cb);
-    };
-    log('[Interceptor] https.request patched ✓');
+
+      try {
+        Object.defineProperty(https, 'request', {
+          value: patchedRequest,
+          writable: true,
+          configurable: true,
+        });
+      } catch {
+        (https as any).request = patchedRequest;
+      }
+      log('[Interceptor] https.request patched ✓');
+    } catch (e: any) {
+      log(`[Interceptor] https.request patch failed (non-fatal): ${e.message}`);
+    }
 
     // ── Self-test ─────────────────────────────────────────────────────────────
     this.selfTest().catch(() => {/* swallow */});
@@ -203,7 +217,15 @@ export class NetworkInterceptor {
     if (!this.active) return;
     this.active = false;
 
-    (https as any).request = this.originalHttpsRequest;
+    try {
+      Object.defineProperty(https, 'request', {
+        value: this.originalHttpsRequest,
+        writable: true,
+        configurable: true,
+      });
+    } catch {
+      try { (https as any).request = this.originalHttpsRequest; } catch {/* swallow */}
+    }
 
     if (this.originalFetch) {
       globalThis.fetch = this.originalFetch;

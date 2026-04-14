@@ -20,6 +20,7 @@ import { PromptOptimizer } from './promptOptimizer';
 import { ModelRouter } from './modelRouter';
 import { TokenCounter, AnthropicRequestBody } from './tokenCounter';
 import { StatsTracker, RequestStat } from './statsTracker';
+import { PiiFilter } from './piiFilter';
 
 const ANTHROPIC_HOST = 'api.anthropic.com';
 const MAX_TRACES = 200;
@@ -35,9 +36,11 @@ export interface MessageTrace {
   cacheReadTokens: number;
   cacheCreationTokens: number;
   savedByCompression: number;
+  savedCostUSD: number;   // total savings for this request (routing + compression + cache)
   techniques: string[];
   streaming: boolean;
   durationMs: number;
+  messagePreview: string; // first 80 chars of last user message — for downloaded logs only
 }
 
 export interface ProxyConfig {
@@ -46,6 +49,7 @@ export interface ProxyConfig {
   enableCache: boolean;
   enableCompression: boolean;
   enableModelRouter: boolean;
+  enablePiiRedaction: boolean;
   apiKey: string;
 }
 
@@ -56,6 +60,7 @@ export class ProxyServer {
   private router: ModelRouter;
   private tokenCounter: TokenCounter;
   private stats: StatsTracker;
+  private piiFilter: PiiFilter;
   private config: ProxyConfig;
   private log: (msg: string) => void;
   private traces: MessageTrace[] = [];
@@ -83,6 +88,7 @@ export class ProxyServer {
     this.tokenCounter = tokenCounter;
     this.stats = stats;
     this.log = log ?? ((msg) => console.log(msg));
+    this.piiFilter = new PiiFilter({ enabled: config.enablePiiRedaction });
     // Capture original https.request NOW (before NetworkInterceptor patches it)
     this.httpsRequest = https.request.bind(https);
   }
@@ -242,16 +248,24 @@ export class ProxyServer {
         }
       }
 
-      // 2. Prompt optimization
+      // 2. PII redaction
+      const piiResult = this.piiFilter.filter(optimizedBody);
+      if (piiResult.count > 0) {
+        this.log(`[pii] Redacted ${piiResult.count} value(s): ${piiResult.types.join(', ')}`);
+        optimizedBody = piiResult.body;
+        techniques.push('pii-redact');
+      }
+
+      // 3. Prompt optimization
       // Note: we track techniques but NOT token savings here — Anthropic's prompt caching
       // makes our pre-send token count unreliable vs the API-reported input_tokens.
       if (this.config.enableCompression) {
-        const result = this.optimizer.optimize(body);
+        const result = this.optimizer.optimize(optimizedBody);
         optimizedBody = result.body;
-        techniques = result.techniques;
+        techniques.push(...result.techniques);
       }
 
-      // 3. Model routing
+      // 4. Model routing
       if (this.config.enableModelRouter) {
         const reqApiKey =
           (req.headers['x-api-key'] as string | undefined) ||
@@ -326,6 +340,7 @@ export class ProxyServer {
             originalModel, finalModel: optimizedBody.model, routingReason,
             inputTokens: finalInputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
             savedByCompression: actualSavedByCompression, techniques, streaming: true, requestStart,
+            messagePreview: lastMsg.slice(0, 80),
           });
         });
       } else {
@@ -357,6 +372,7 @@ export class ProxyServer {
           originalModel, finalModel: optimizedBody.model, routingReason,
           inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
           savedByCompression: actualSavedByCompression, techniques, streaming: false, requestStart,
+          messagePreview: lastMsg.slice(0, 80),
         });
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -668,7 +684,26 @@ export class ProxyServer {
     techniques: string[];
     streaming: boolean;
     requestStart: number;
+    messagePreview?: string;
   }): void {
+    const routingSavings = this.router.estimateSavings(
+      params.originalModel, params.finalModel,
+      params.inputTokens, params.outputTokens,
+      params.cacheReadTokens, params.cacheCreationTokens,
+    );
+    const compressionSavings =
+      (params.savedByCompression / 1_000_000) * this.router.inputPriceFor(params.originalModel);
+    const anthropicCacheSavings =
+      (params.cacheReadTokens / 1_000_000) * this.router.inputPriceFor(params.finalModel) * 0.90;
+    const savedCostUSD = routingSavings + compressionSavings + anthropicCacheSavings;
+
+    if (params.originalModel !== params.finalModel) {
+      const pct = params.originalModel && params.finalModel
+        ? ` (${((routingSavings / Math.max(0.000001, routingSavings + this.router.estimateCost(params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens))) * 100).toFixed(0)}% cheaper)`
+        : '';
+      this.log(`[route] ${params.originalModel.replace('claude-','')} → ${params.finalModel.replace('claude-','')} | reason: ${params.routingReason} | saved $${routingSavings.toFixed(4)}${pct}`);
+    }
+
     const trace: MessageTrace = {
       id: Math.random().toString(36).slice(2, 8),
       timestamp: Date.now(),
@@ -680,9 +715,11 @@ export class ProxyServer {
       cacheReadTokens: params.cacheReadTokens,
       cacheCreationTokens: params.cacheCreationTokens,
       savedByCompression: params.savedByCompression,
+      savedCostUSD,
       techniques: params.techniques,
       streaming: params.streaming,
       durationMs: Date.now() - params.requestStart,
+      messagePreview: params.messagePreview ?? '',
     };
     this.traces.push(trace);
     if (this.traces.length > MAX_TRACES) this.traces.shift();

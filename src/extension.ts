@@ -89,7 +89,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Update status bar on every stat update
   stats.onUpdate(s => {
-    updateStatusBar(s.totalSavedTokens, proxy?.isRunning() ?? false);
+    updateStatusBar(s.totalSavedTokens, proxy?.isRunning() || isAttachedToExistingProxy);
   });
 
   // ── Proxy server ──────────────────────────────────────────────────────────
@@ -99,12 +99,15 @@ export async function activate(context: vscode.ExtensionContext) {
     enableCache: config.get<boolean>('enableCache', true),
     enableCompression: config.get<boolean>('enablePromptCompression', true),
     enableModelRouter: config.get<boolean>('enableModelRouter', true),
+    enablePiiRedaction: config.get<boolean>('enablePiiRedaction', true),
     apiKey: config.get<string>('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
   };
 
   proxy = new ProxyServer(proxyConfig, cache, optimizer, router, tokenCounter, stats,
     (msg) => out.appendLine(`[${new Date().toISOString().slice(11,19)}] ${msg}`)
   );
+
+  setStatusBarLoading();
 
   // ── Dashboard HTTP server ─────────────────────────────────────────────────
   const dashboardPort = config.get<number>('dashboardPort', 8788);
@@ -200,8 +203,12 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('claudeOptimizer.toggle', () => {
-      if (!proxy?.isRunning()) {
+      if (!proxy?.isRunning() && !isAttachedToExistingProxy) {
         vscode.window.showWarningMessage('Claude Optimizer: Proxy is not running. Press F5 first.');
+        return;
+      }
+      if (isAttachedToExistingProxy && !proxy?.isRunning()) {
+        vscode.window.showInformationMessage('Claude Optimizer: Routing active via proxy owned by another window.');
         return;
       }
       const nowEnabled = proxy!.toggle();
@@ -323,6 +330,11 @@ function updateStatusBar(savedTokens: number, proxyRunning: boolean, optimizerEn
   statusBarItem.backgroundColor = optimizerEnabled && proxyRunning
     ? undefined
     : new vscode.ThemeColor('statusBarItem.warningBackground');
+}
+
+function setStatusBarLoading(): void {
+  statusBarItem.text = '$(loading~spin) Claude Optimizer: Starting...';
+  statusBarItem.backgroundColor = undefined;
 }
 
 function registerIntegrations(

@@ -12,7 +12,7 @@
  */
 
 import * as http from 'http';
-import { StatsTracker, SessionStats } from '../statsTracker';
+import { StatsTracker } from '../statsTracker';
 
 export class DashboardServer {
   private server: http.Server | null = null;
@@ -97,12 +97,18 @@ export class DashboardServer {
   .b { background: #0d1b2e; color: #58a6ff; }
   .r { background: #2b0d0d; color: #f85149; }
   code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 0.88em; }
-  .actions { margin-top: 20px; display: flex; gap: 8px; }
+  .actions { margin-top: 20px; display: flex; gap: 8px; flex-wrap: wrap; }
   button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 7px 16px; border-radius: 6px; cursor: pointer; font-size: 0.85em; }
   button:hover { background: #30363d; }
   button.danger { border-color: #f85149; color: #f85149; }
+  button.dl { border-color: #58a6ff; color: #58a6ff; }
   .status { font-size: 0.75em; color: #8b949e; margin-top: 16px; }
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #3fb950; margin-right: 5px; }
+  .tiers { display: flex; gap: 10px; margin-bottom: 24px; flex-wrap: wrap; }
+  .tier { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 12px 16px; flex: 1; min-width: 140px; }
+  .tier .tlabel { font-size: 0.72em; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+  .tier .treqs { font-size: 1.4em; font-weight: 700; color: #e6edf3; }
+  .tier .tsaved { font-size: 0.82em; color: #3fb950; margin-top: 2px; }
   @media (max-width: 700px) { .grid { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -122,13 +128,21 @@ export class DashboardServer {
   <div class="card"><div class="label">Model Routes</div><div class="value" id="downgrades">—</div><div class="hint">Routed to cheaper model</div></div>
 </div>
 
+<h2 style="font-size:0.95em;font-weight:600;margin-bottom:10px;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em">Savings by Tier</h2>
+<div class="tiers">
+  <div class="tier"><div class="tlabel">Haiku</div><div class="treqs" id="haiku_reqs">—</div><div class="tsaved" id="haiku_saved">—</div></div>
+  <div class="tier"><div class="tlabel">Sonnet</div><div class="treqs" id="sonnet_reqs">—</div><div class="tsaved" id="sonnet_saved">—</div></div>
+  <div class="tier"><div class="tlabel">Opus</div><div class="treqs" id="opus_reqs">—</div><div class="tsaved" id="opus_saved">—</div></div>
+</div>
+
 <h2 style="font-size:0.95em;font-weight:600;margin-bottom:10px;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em">Recent Requests</h2>
 <table>
-  <thead><tr><th>Time</th><th>Model</th><th>In</th><th>Out</th><th>Cache Read</th><th>Cache Write</th><th>Saved</th><th>ms</th><th>Tags</th></tr></thead>
-  <tbody id="tbody"><tr><td colspan="9" style="color:#8b949e;padding:16px 10px">Waiting for requests…</td></tr></tbody>
+  <thead><tr><th>Time</th><th>Model</th><th>In</th><th>Out</th><th>Reason</th><th>Cost</th><th>ms</th><th>Tags</th></tr></thead>
+  <tbody id="tbody"><tr><td colspan="8" style="color:#8b949e;padding:16px 10px">Waiting for requests…</td></tr></tbody>
 </table>
 
 <div class="actions">
+  <button onclick="downloadLogs()">Download logs (CSV)</button>
   <button onclick="clearStats()">Clear stats</button>
   <button class="danger" onclick="clearAll()">Clear all proxy state</button>
 </div>
@@ -154,28 +168,47 @@ function renderStats(s) {
   document.getElementById('cacheHits').textContent = s.cacheHits;
   document.getElementById('totalReqs').textContent = 'of ' + s.totalRequests + ' requests';
   document.getElementById('downgrades').textContent = s.modelDowngrades;
+
+  // Per-tier breakdown
+  const tiers = { haiku: {reqs: 0, saved: 0}, sonnet: {reqs: 0, saved: 0}, opus: {reqs: 0, saved: 0} };
+  s.requests.forEach(r => {
+    const m = (r.finalModel||'').toLowerCase();
+    if (m.includes('haiku')) { tiers.haiku.reqs++; tiers.haiku.saved += r.savedCostUSD || 0; }
+    else if (m.includes('sonnet')) { tiers.sonnet.reqs++; tiers.sonnet.saved += r.savedCostUSD || 0; }
+    else if (m.includes('opus')) { tiers.opus.reqs++; tiers.opus.saved += r.savedCostUSD || 0; }
+  });
+  ['haiku', 'sonnet', 'opus'].forEach(t => {
+    const el = document.getElementById(t + '_reqs');
+    const el2 = document.getElementById(t + '_saved');
+    if (el && el2) {
+      el.textContent = tiers[t].reqs || '—';
+      el2.textContent = tiers[t].reqs > 0 ? fmtCost(tiers[t].saved) + ' saved' : '—';
+    }
+  });
 }
 
 function renderTraces(traces) {
   const tbody = document.getElementById('tbody');
   if (!traces.length) {
-    tbody.innerHTML = '<tr><td colspan="9" style="color:#8b949e;padding:16px 10px">No requests yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="color:#8b949e;padding:16px 10px">No requests yet.</td></tr>';
     return;
   }
   tbody.innerHTML = traces.slice(0, 20).map(r => {
     const tags = [];
-    if (r.finalModel !== r.originalModel) tags.push('<span class="badge b">routed→' + (r.finalModel||'').replace('claude-','') + '</span>');
+    if (r.finalModel !== r.originalModel) tags.push('<span class="badge b">→' + (r.finalModel||'').replace('claude-','') + '</span>');
     if ((r.techniques||[]).includes('context-trim')) tags.push('<span class="badge r">trimmed</span>');
     if (r.streaming) tags.push('<span class="badge b">stream</span>');
-    const saved = r.savedByCompression || 0;
+    const savedCost = r.savedCostUSD > 0 ? fmtCost(r.savedCostUSD) : '—';
+    const reason = r.routingReason && r.routingReason !== 'passthrough'
+      ? '<span title="' + r.routingReason + '">' + r.routingReason.slice(0, 20) + '</span>'
+      : '<span style="color:#8b949e">pass</span>';
     return '<tr>' +
       '<td style="color:#8b949e">' + ago(r.timestamp) + '</td>' +
-      '<td><code>' + (r.originalModel||'').replace('claude-','') + '</code></td>' +
+      '<td><code>' + (r.finalModel||'').replace('claude-','') + '</code></td>' +
       '<td>' + fmt(r.inputTokens) + '</td>' +
       '<td>' + fmt(r.outputTokens) + '</td>' +
-      '<td style="color:#58a6ff">' + (r.cacheReadTokens > 0 ? fmt(r.cacheReadTokens) : '—') + '</td>' +
-      '<td style="color:#f0883e">' + (r.cacheCreationTokens > 0 ? fmt(r.cacheCreationTokens) : '—') + '</td>' +
-      '<td style="color:#3fb950">' + (saved > 0 ? '+' + fmt(saved) : '—') + '</td>' +
+      '<td style="font-size:0.78em;color:#8b949e">' + reason + '</td>' +
+      '<td style="color:#3fb950">' + savedCost + '</td>' +
       '<td style="color:#8b949e">' + ms(r.durationMs) + '</td>' +
       '<td>' + (tags.join('') || '—') + '</td>' +
     '</tr>';
@@ -188,6 +221,24 @@ async function poll() {
     renderStats(await sr.json());
     renderTraces(await tr.json());
   } catch {}
+}
+
+async function downloadLogs() {
+  const r = await fetch('/traces');
+  const traces = await r.json();
+  const cols = ['id','timestamp','originalModel','finalModel','routingReason','inputTokens','outputTokens',
+    'cacheReadTokens','cacheCreationTokens','savedByCompression','savedCostUSD','durationMs','streaming','techniques','messagePreview'];
+  const csv = [cols.join(','), ...traces.map(t =>
+    cols.map(c => {
+      const v = Array.isArray(t[c]) ? t[c].join('|') : (t[c] ?? '');
+      return '"' + String(v).replace(/"/g, '""') + '"';
+    }).join(',')
+  )].join('\\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'claude-steward-traces-' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
 }
 
 async function clearStats() {
