@@ -48,6 +48,7 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const net = __importStar(require("net"));
+const child_process_1 = require("child_process");
 const tokenCounter_1 = require("./tokenCounter");
 const promptOptimizer_1 = require("./promptOptimizer");
 const semanticCache_1 = require("./semanticCache");
@@ -122,6 +123,19 @@ async function activate(context) {
         enablePiiRedaction: config.get('enablePiiRedaction', true),
         apiKey: config.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
     };
+    // ── Startup cleanup — clear stale ANTHROPIC_BASE_URL from registry ──────────
+    // Handles crash-on-shutdown or port-change scenarios where old value lingers.
+    if (process.platform === 'win32') {
+        (0, child_process_1.exec)(`powershell -NoProfile -Command "[System.Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL','User')"`, (_err, stdout) => {
+            const existing = stdout.trim();
+            const expected = `http://localhost:${proxyConfig.port}`;
+            if (existing && existing !== expected) {
+                (0, child_process_1.exec)(`reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f`, () => {
+                    exports.out.appendLine(`[CLEANUP] Cleared stale ANTHROPIC_BASE_URL (was: ${existing})`);
+                });
+            }
+        });
+    }
     proxy = new proxyServer_1.ProxyServer(proxyConfig, cache, optimizer, router, tokenCounter, stats, (msg) => exports.out.appendLine(`[${new Date().toISOString().slice(11, 19)}] ${msg}`));
     setStatusBarLoading();
     // ── Dashboard HTTP server ─────────────────────────────────────────────────
@@ -157,14 +171,31 @@ async function activate(context) {
     const envColl = context.environmentVariableCollection;
     envColl.description = new vscode.MarkdownString('Set by **Claude Steward** to route Claude Code traffic through the local optimising proxy.');
     interceptor = new networkInterceptor_1.NetworkInterceptor(proxyConfig.port);
+    function setUserEnvVar(value) {
+        // Use setx to persist at Windows user level — same as set_env.bat but automatic.
+        // setx writes to HKCU; no admin required. New processes pick it up immediately.
+        if (process.platform === 'win32') {
+            const cmd = value
+                ? `setx ANTHROPIC_BASE_URL "${value}"`
+                : `reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f`;
+            (0, child_process_1.exec)(cmd, (err) => {
+                if (err)
+                    exports.out.appendLine(`[ENV] setx failed: ${err.message}`);
+                else
+                    exports.out.appendLine(`[ENV] ANTHROPIC_BASE_URL ${value ? `set to ${value}` : 'cleared'} (user env)`);
+            });
+        }
+    }
     function activateRouting() {
         process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
         envColl.replace('ANTHROPIC_BASE_URL', proxyUrl);
+        setUserEnvVar(proxyUrl);
         interceptor.install();
     }
     function deactivateRouting() {
         delete process.env['ANTHROPIC_BASE_URL'];
         envColl.delete('ANTHROPIC_BASE_URL');
+        setUserEnvVar(null);
         interceptor.uninstall();
     }
     // Start health-check loop for the attached-window case (extracted to avoid duplication)

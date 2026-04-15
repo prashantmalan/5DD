@@ -104,6 +104,23 @@ export async function activate(context: vscode.ExtensionContext) {
     apiKey: config.get<string>('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
   };
 
+  // ── Startup cleanup — clear stale ANTHROPIC_BASE_URL from registry ──────────
+  // Handles crash-on-shutdown or port-change scenarios where old value lingers.
+  if (process.platform === 'win32') {
+    exec(
+      `powershell -NoProfile -Command "[System.Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL','User')"`,
+      (_err, stdout) => {
+        const existing = stdout.trim();
+        const expected = `http://localhost:${proxyConfig.port}`;
+        if (existing && existing !== expected) {
+          exec(`reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f`, () => {
+            out.appendLine(`[CLEANUP] Cleared stale ANTHROPIC_BASE_URL (was: ${existing})`);
+          });
+        }
+      }
+    );
+  }
+
   proxy = new ProxyServer(proxyConfig, cache, optimizer, router, tokenCounter, stats,
     (msg) => out.appendLine(`[${new Date().toISOString().slice(11,19)}] ${msg}`)
   );
