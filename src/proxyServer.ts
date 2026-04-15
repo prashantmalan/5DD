@@ -184,6 +184,19 @@ export class ProxyServer {
       return;
     }
 
+    // Stats/traces served from the proxy port so multi-window ownership works:
+    // whoever owns :8787 also owns the authoritative stats.
+    if (req.url === '/proxy-stats' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify(this.stats.getSessionStats()));
+      return;
+    }
+    if (req.url === '/proxy-traces' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify(this.getTraces()));
+      return;
+    }
+
     const rawBody = await readBody(req);
 
     // Master switch OFF → pass through completely unchanged

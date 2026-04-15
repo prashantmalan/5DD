@@ -395,16 +395,23 @@ function renderTraces(traces) {
   knownIds = new Set(rows.map((r,i) => r.id || i));
 }
 
+// Always read stats/traces from the proxy port (:8787) — whoever owns the proxy
+// owns the authoritative stats, even across multi-window ownership transfers.
+const PROXY_ORIGIN = 'http://localhost:8787';
+
 async function poll() {
   try {
-    const [sr, tr] = await Promise.all([fetch('/stats'), fetch('/traces')]);
+    const [sr, tr] = await Promise.all([
+      fetch(PROXY_ORIGIN + '/proxy-stats'),
+      fetch(PROXY_ORIGIN + '/proxy-traces'),
+    ]);
     renderStats(await sr.json());
     renderTraces(await tr.json());
   } catch {}
 }
 
 async function downloadLogs() {
-  const r = await fetch('/traces');
+  const r = await fetch(PROXY_ORIGIN + '/proxy-traces');
   const traces = await r.json();
   const cols = ['id','timestamp','originalModel','finalModel','routingReason','inputTokens','outputTokens',
     'cacheReadTokens','cacheCreationTokens','savedByCompression','savedCostUSD','durationMs','streaming','techniques','messagePreview'];
