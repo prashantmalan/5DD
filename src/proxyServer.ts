@@ -256,6 +256,7 @@ export class ProxyServer {
 
     // Hoisted so the streaming callback (outside the try block) can read it.
     let originalTokens = this.tokenCounter.countRequest(body).prompt;
+    let compressedTokens = originalTokens;
 
     try {
       // Token count (re-use the already-computed value above)
@@ -304,6 +305,7 @@ export class ProxyServer {
             const result = this.optimizer.optimize(optimizedBody);
             optimizedBody = result.body;
             techniques.push(...result.techniques);
+            compressedTokens = this.tokenCounter.countRequest(optimizedBody).prompt;
           }
         }),
         // Routing (async — makes Haiku classifier call on cache miss)
@@ -369,10 +371,8 @@ export class ProxyServer {
       if (isStreaming) {
         this.forwardStreaming(req, optimizedBody, res, (inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens) => {
           const finalInputTokens = inputTokens || originalTokens;
-          // Savings = tokens we removed via compression only.
-          // originalTokens ≈ inputTokens + cacheCreationTokens + cacheReadTokens (all tokens in request).
-          // Subtracting all three leaves only tokens the optimizer actually removed.
-          const actualSavedByCompression = Math.max(0, originalTokens - (finalInputTokens + cacheCreationTokens + cacheReadTokens));
+          // Savings = what our optimizer removed (before vs after compression), not Anthropic's cache discount.
+          const actualSavedByCompression = Math.max(0, originalTokens - compressedTokens);
           this.stats.record(this.buildStat({
             body: optimizedBody, originalModel, finalModel: optimizedBody.model,
             inputTokens: finalInputTokens, outputTokens,
@@ -400,8 +400,8 @@ export class ProxyServer {
         const outputTokens = response?.usage?.output_tokens ?? 0;
         const cacheReadTokens = response?.usage?.cache_read_input_tokens ?? 0;
         const cacheCreationTokens = response?.usage?.cache_creation_input_tokens ?? 0;
-        // Savings = only tokens the optimizer actually removed from the request.
-        const actualSavedByCompression = Math.max(0, originalTokens - (inputTokens + cacheCreationTokens + cacheReadTokens));
+        // Savings = what our optimizer removed (before vs after compression), not Anthropic's cache discount.
+        const actualSavedByCompression = Math.max(0, originalTokens - compressedTokens);
 
         if (this.config.enableCache && !response?.error) {
           this.cache.store(optimizedBody, response, inputTokens);
