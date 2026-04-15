@@ -340,10 +340,10 @@ export class ProxyServer {
       if (isStreaming) {
         this.forwardStreaming(req, optimizedBody, res, (inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens) => {
           const finalInputTokens = inputTokens || originalTokens;
-          // Mirror the non-streaming savings computation: compare pre-optimization token
-          // estimate against what the API actually billed (input_tokens only; cache reads
-          // are already a form of savings tracked separately).
-          const actualSavedByCompression = Math.max(0, originalTokens - finalInputTokens);
+          // Savings = tokens we removed via compression only.
+          // input_tokens + cache_creation_input_tokens = total tokens Anthropic processed.
+          // We must NOT count Anthropic's own cache handling as our savings.
+          const actualSavedByCompression = Math.max(0, originalTokens - (finalInputTokens + cacheCreationTokens));
           this.stats.record(this.buildStat({
             body: optimizedBody, originalModel, finalModel: optimizedBody.model,
             inputTokens: finalInputTokens, outputTokens,
@@ -371,7 +371,8 @@ export class ProxyServer {
         const outputTokens = response?.usage?.output_tokens ?? 0;
         const cacheReadTokens = response?.usage?.cache_read_input_tokens ?? 0;
         const cacheCreationTokens = response?.usage?.cache_creation_input_tokens ?? 0;
-        const actualSavedByCompression = Math.max(0, originalTokens - inputTokens);
+        // Same fix: don't count Anthropic's own cache creation as our compression savings.
+        const actualSavedByCompression = Math.max(0, originalTokens - (inputTokens + cacheCreationTokens));
 
         if (this.config.enableCache && !response?.error) {
           this.cache.store(optimizedBody, response, inputTokens);
@@ -483,27 +484,25 @@ export class ProxyServer {
         }
 
         res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-        let window = '';  // sliding 4KB window — avoids unbounded string growth
         let inputTokens = 0;
         let outputTokens = 0;
         let cacheReadTokens = 0;
         let cacheCreationTokens = 0;
-        let lastOutputTokens = 0;
+        // tail: sliding 2KB window used only for output_tokens (last occurrence wins).
+        // input/cache tokens appear once near stream start — captured per-chunk before sliding.
+        let tail = '';
 
         proxyRes.on('data', (chunk: Buffer) => {
           res.write(chunk);
-          window = (window + chunk.toString()).slice(-4096);
-          // Parse usage fields from SSE events:
-          //   message_start carries input_tokens and cache counts (appear once)
-          //   message_delta carries the FINAL output_tokens (use last seen value)
-          const inputMatch = window.match(/"input_tokens":(\d+)/);
-          const outputMatch = window.match(/(?:.*"output_tokens":(\d+))/s);
-          const cacheReadMatch = window.match(/"cache_read_input_tokens":(\d+)/);
-          const cacheCreateMatch = window.match(/"cache_creation_input_tokens":(\d+)/);
-          if (inputMatch) inputTokens = parseInt(inputMatch[1]);
-          if (outputMatch) { const v = parseInt(outputMatch[1]); if (v > lastOutputTokens) { outputTokens = v; lastOutputTokens = v; } }
-          if (cacheReadMatch) cacheReadTokens = parseInt(cacheReadMatch[1]);
-          if (cacheCreateMatch) cacheCreationTokens = parseInt(cacheCreateMatch[1]);
+          const str = chunk.toString();
+          // Capture start-of-stream fields on first occurrence (appear in message_start)
+          if (inputTokens === 0) { const m = str.match(/"input_tokens":(\d+)/); if (m) inputTokens = parseInt(m[1]); }
+          if (cacheReadTokens === 0) { const m = str.match(/"cache_read_input_tokens":(\d+)/); if (m) cacheReadTokens = parseInt(m[1]); }
+          if (cacheCreationTokens === 0) { const m = str.match(/"cache_creation_input_tokens":(\d+)/); if (m) cacheCreationTokens = parseInt(m[1]); }
+          // output_tokens: keep last value seen (message_delta overwrites message_start's placeholder)
+          tail = (tail + str).slice(-2048);
+          const om = tail.match(/(?:.*"output_tokens":(\d+))/s);
+          if (om) { const v = parseInt(om[1]); if (v > outputTokens) outputTokens = v; }
         });
         proxyRes.on('end', () => { res.end(); onDone(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens); });
         proxyRes.on('error', () => res.end());
