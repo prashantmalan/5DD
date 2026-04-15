@@ -63,7 +63,12 @@ export class StatsTracker {
     const cacheHits = this.stats.filter(r => r.cacheHit).length;
     const modelDowngrades = this.stats.filter(r => r.modelDowngraded).length;
 
-    const totalConsumed = totalInputTokens + totalSavedTokens;
+    // Full request size = fresh + cache tokens + what we removed via compression/cache.
+    // Using just inputTokens (fresh only) in the denominator inflates the savings rate
+    // when Anthropic's prompt cache is active.
+    const totalCacheReadTokens = this.stats.reduce((s, r) => s + (r.cacheHit ? 0 : r.cacheReadTokens), 0);
+    const totalCacheCreationTokens = this.stats.reduce((s, r) => s + (r.cacheHit ? 0 : r.cacheCreationTokens), 0);
+    const totalConsumed = totalInputTokens + totalCacheReadTokens + totalCacheCreationTokens + totalSavedTokens;
     const avgSavingsPct = totalConsumed > 0
       ? (totalSavedTokens / totalConsumed) * 100
       : 0;
