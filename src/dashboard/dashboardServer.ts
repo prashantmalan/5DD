@@ -236,6 +236,7 @@ export class DashboardServer {
     <div class="label">Cost Saved</div>
     <div class="value" id="savedCost">—</div>
     <div class="hint" id="totalCost">—</div>
+    <div class="hint" id="costBreakdown" style="margin-top:4px;font-size:0.75em;color:#8b949e"></div>
   </div>
   <div class="card" id="card-cache">
     <div class="label">Cache Hits</div>
@@ -249,17 +250,24 @@ export class DashboardServer {
   </div>
 </div>
 
+<!-- Cost reasoning box -->
+<div id="cost-reasoning" style="display:none;background:#161b22;border:1px solid #21262d;border-left:3px solid #3fb950;border-radius:6px;padding:12px 16px;margin-bottom:20px;font-size:0.82em;line-height:1.6">
+  <strong style="font-size:0.9em;display:block;margin-bottom:8px;color:#e6edf3">How your savings are calculated</strong>
+  <div id="reasoning-text" style="color:#8b949e"></div>
+</div>
+
 <h2 style="font-size:0.95em;font-weight:600;margin-bottom:10px;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em">Recent Requests</h2>
 <table>
   <thead><tr>
     <th title="How long ago the request was made">Time</th>
     <th title="Final Claude model that processed the request (may differ from what was requested)">Model</th>
-    <th title="Input tokens sent to the API (after optimization)">In <span class="th-tip">tokens</span></th>
+    <th title="Original prompt size before our compression vs actual tokens sent to Anthropic">Original → Sent <span class="th-tip">tokens</span></th>
     <th title="Output tokens returned by the API">Out <span class="th-tip">tokens</span></th>
-    <th title="Tokens saved by compression/cache vs original request">Saved <span class="th-tip">tokens</span></th>
+    <th title="Tokens removed by our optimizer, and what % of the original that represents">Saved <span class="th-tip">tokens · %</span></th>
+    <th title="Cost saved on this request: compression + routing savings">$ Saved</th>
     <th title="Badges: stream=streaming response, trimmed=context was compressed, →model=model was routed">Tags</th>
   </tr></thead>
-  <tbody id="tbody"><tr><td colspan="6" style="color:#8b949e;padding:16px 10px">Waiting for requests…</td></tr></tbody>
+  <tbody id="tbody"><tr><td colspan="7" style="color:#8b949e;padding:16px 10px">Waiting for requests…</td></tr></tbody>
 </table>
 
 <div class="actions">
@@ -268,7 +276,7 @@ export class DashboardServer {
   <button class="danger" onclick="clearAll()">Clear all proxy state</button>
 </div>
 
-<div class="status"><span class="dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#3fb950;margin-right:5px"></span>Auto-refreshing · Proxy on <code>localhost:8787</code> · <a href="#how-it-works" style="color:#58a6ff;text-decoration:none">How it works ↓</a></div>
+<div class="status" id="proxy-status-bar"><span id="proxy-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#8b949e;margin-right:5px"></span><span id="proxy-status-text">Connecting to proxy…</span> · <a href="#how-it-works" style="color:#58a6ff;text-decoration:none">How it works ↓</a></div>
 
 <script>
 function fmt(n) { return n >= 1000 ? (n/1000).toFixed(1)+'k' : String(Math.round(n||0)); }
@@ -337,9 +345,46 @@ connectSSE();
 // ── stats render ─────────────────────────────────────────────────────────────
 function renderStats(s) {
   document.getElementById('savedTokens').textContent = fmt(s.totalSavedTokens);
-  document.getElementById('savingsPct').textContent = (s.avgSavingsPct||0).toFixed(1) + '% savings rate';
+  document.getElementById('savingsPct').textContent = (s.avgSavingsPct||0).toFixed(1) + '% of original prompts removed';
   document.getElementById('savedCost').textContent = fmtCost(s.totalSavedCostUSD);
   document.getElementById('totalCost').textContent = 'Total spent: ' + fmtCost(s.totalCostUSD);
+
+  // Cost breakdown hint on card
+  const byCmp = s.totalSavedCostByCompression || 0;
+  const byRte = s.totalSavedCostByRouting || 0;
+  const parts = [];
+  if (byCmp > 0) parts.push('✂️ ' + fmtCost(byCmp) + ' compression');
+  if (byRte > 0) parts.push('🔀 ' + fmtCost(byRte) + ' routing');
+  document.getElementById('costBreakdown').textContent = parts.join(' · ');
+
+  // Plain-English reasoning box
+  const box = document.getElementById('cost-reasoning');
+  const txt = document.getElementById('reasoning-text');
+  if (s.totalRequests > 0 && s.totalSavedCostUSD > 0) {
+    box.style.display = 'block';
+    const apiReqs = s.totalRequests - (s.cacheHits || 0);
+    const avgOrig = apiReqs > 0 ? Math.round(s.totalOriginalTokens / apiReqs) : 0;
+    const avgSent = apiReqs > 0 ? Math.round((s.totalOriginalTokens - s.totalSavedTokens) / apiReqs) : 0;
+    const avgRemoved = avgOrig - avgSent;
+    let html = '';
+    if (byCmp > 0 && avgOrig > 0) {
+      html += '<div style="margin-bottom:6px">✂️ <strong>Compression:</strong> Your prompts averaged <strong>' + fmt(avgOrig) + ' tokens</strong> before optimization. '
+        + 'We trimmed them to ~<strong>' + fmt(avgSent) + ' tokens</strong> before sending — removing <strong>' + fmt(avgRemoved) + ' tokens</strong> per request. '
+        + 'Those removed tokens × Anthropic\'s input price = <strong>' + fmtCost(byCmp) + ' saved</strong> across ' + apiReqs + ' request' + (apiReqs !== 1 ? 's' : '') + '.</div>';
+    }
+    if (byRte > 0) {
+      html += '<div style="margin-bottom:6px">🔀 <strong>Model routing:</strong> ' + (s.modelDowngrades||0) + ' request' + ((s.modelDowngrades||0) !== 1 ? 's were' : ' was')
+        + ' sent to a cheaper model instead of the one requested. Cost difference = <strong>' + fmtCost(byRte) + ' saved</strong>.</div>';
+    }
+    if (s.cacheHits > 0) {
+      html += '<div>⚡ <strong>Semantic cache:</strong> ' + s.cacheHits + ' request' + (s.cacheHits !== 1 ? 's were' : ' was')
+        + ' answered instantly from cache — no API call made.</div>';
+    }
+    txt.innerHTML = html || 'No savings yet this session.';
+  } else {
+    box.style.display = s.totalRequests > 0 ? 'block' : 'none';
+    txt.innerHTML = 'No savings recorded yet — savings appear after your first optimized request.';
+  }
   document.getElementById('cacheHits').textContent = s.cacheHits;
   document.getElementById('totalReqs').textContent = 'of ' + s.totalRequests + ' requests';
   document.getElementById('downgrades').textContent = s.modelDowngrades;
@@ -370,25 +415,38 @@ function renderTraces(traces) {
     const saved = r.savedByCompression || 0;
     const cacheR = r.cacheReadTokens || 0;
     const cacheC = r.cacheCreationTokens || 0;
+    const fresh = r.inputTokens || 0;
+    // originalTokens may come from newer traces; fall back to computing it
+    const origTok = r.originalTokens || (fresh + cacheR + cacheC + saved);
+    const sentTok = fresh + cacheR + cacheC;
+    const savePct = origTok > 0 ? Math.round(saved / origTok * 100) : 0;
 
-    // token breakdown tooltip: in | out | cache↑ | cache↓ | saved
-    const tokenDetail = [
-      'in: ' + fmt(r.inputTokens),
-      'out: ' + fmt(r.outputTokens),
-      cacheC > 0 ? 'cache-write: ' + fmt(cacheC) : '',
-      cacheR > 0 ? 'cache-read: '  + fmt(cacheR)  : '',
-      saved > 0  ? 'saved: '       + fmt(saved)    : '',
+    // Cost breakdown tooltip
+    const byCmp = r.savedCostByCompression || 0;
+    const byRte = r.savedCostByRouting || 0;
+    const costTip = [
+      'Total saved: $' + (r.savedCostUSD||0).toFixed(4),
+      byCmp > 0 ? '✂️ compression: $' + byCmp.toFixed(4) : '',
+      byRte > 0 ? '🔀 routing: $' + byRte.toFixed(4) : '',
     ].filter(Boolean).join(' · ');
 
-    return '<tr class="' + (isNew ? 'new-row' : '') + '" title="' + tokenDetail + '">' +
+    return '<tr class="' + (isNew ? 'new-row' : '') + '">' +
       '<td style="color:#8b949e">' + ago(r.timestamp) + '</td>' +
       '<td><code>' + (r.finalModel||'').replace('claude-','') + '</code></td>' +
-      '<td>' + fmt(r.inputTokens) +
-        (cacheC > 0 ? ' <span style="color:#e3b341;font-size:0.75em" title="cache write">+' + fmt(cacheC) + '↑</span>' : '') +
-        (cacheR > 0 ? ' <span style="color:#58a6ff;font-size:0.75em" title="cache read">+' + fmt(cacheR)  + '↓</span>' : '') +
+      '<td title="Original: ' + fmt(origTok) + ' tokens before compression → ' + fmt(sentTok) + ' tokens sent to Anthropic">' +
+        (saved > 0
+          ? '<span style="color:#8b949e">' + fmt(origTok) + '</span> → ' + fmt(sentTok)
+          : fmt(sentTok)) +
+        (cacheC > 0 ? ' <span style="color:#e3b341;font-size:0.75em" title="Anthropic cache write: new content cached this turn">+' + fmt(cacheC) + '↑</span>' : '') +
+        (cacheR > 0 ? ' <span style="color:#58a6ff;font-size:0.75em" title="Anthropic cache read: previously cached content served at ~10% cost">+' + fmt(cacheR) + '↓</span>' : '') +
       '</td>' +
       '<td>' + fmt(r.outputTokens) + '</td>' +
-      '<td style="color:' + (saved > 0 ? '#3fb950' : '#8b949e') + '">' + (saved > 0 ? fmt(saved) : '—') + '</td>' +
+      '<td style="color:' + (saved > 0 ? '#3fb950' : '#8b949e') + '" title="' + fmt(saved) + ' tokens removed (' + savePct + '% of original ' + fmt(origTok) + ')">' +
+        (saved > 0 ? fmt(saved) + ' <span style="font-size:0.8em;color:#3fb95099">(' + savePct + '%)</span>' : '—') +
+      '</td>' +
+      '<td style="color:' + ((r.savedCostUSD||0) > 0 ? '#3fb950' : '#8b949e') + '" title="' + costTip + '">' +
+        ((r.savedCostUSD||0) > 0 ? '$' + (r.savedCostUSD).toFixed(4) : '—') +
+      '</td>' +
       '<td>' + (tags.join(' ') || '—') + '</td>' +
     '</tr>';
   }).join('');
@@ -399,15 +457,29 @@ function renderTraces(traces) {
 // owns the authoritative stats, even across multi-window ownership transfers.
 const PROXY_ORIGIN = 'http://localhost:8787';
 
+function setProxyStatus(online) {
+  const dot = document.getElementById('proxy-dot');
+  const txt = document.getElementById('proxy-status-text');
+  if (!dot || !txt) return;
+  dot.style.background = online ? '#3fb950' : '#f85149';
+  txt.textContent = online
+    ? 'Proxy connected · localhost:8787 · auto-refreshing'
+    : 'Proxy offline — restart VS Code to reconnect (localhost:8787 not responding)';
+}
+
 async function poll() {
   try {
     const [sr, tr] = await Promise.all([
       fetch(PROXY_ORIGIN + '/proxy-stats'),
       fetch(PROXY_ORIGIN + '/proxy-traces'),
     ]);
+    if (!sr.ok) throw new Error('stats ' + sr.status);
     renderStats(await sr.json());
     renderTraces(await tr.json());
-  } catch {}
+    setProxyStatus(true);
+  } catch(e) {
+    setProxyStatus(false);
+  }
 }
 
 async function downloadLogs() {
@@ -473,7 +545,9 @@ setInterval(poll, 1500);
     <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Cost Saved</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Dollar savings from our routing + compression. Does not include Anthropic's own prompt-cache discounts.</div>
     <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Cache Hits</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Requests answered from our semantic cache — no API call made.</div>
     <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Model Routes</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Requests redirected to a cheaper model tier by the router.</div>
-    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Saved (table)</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Per-request tokens saved by our compression. — means no compression was applied.</div>
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Original → Sent</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Original = full prompt size before our optimizer ran. Sent = what actually went to Anthropic. ↑ = new content written to Anthropic's cache this turn. ↓ = content read from Anthropic's cache at ~10% cost.</div>
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">Saved (tokens · %)</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Tokens our optimizer removed, and what percentage of the original prompt that represents. Hover for details.</div>
+    <div style="padding:8px 14px;font-size:0.8em;font-weight:600;border-bottom:1px solid #21262d">$ Saved</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e;border-bottom:1px solid #21262d">Estimated cost saved on this request from compression + routing. Hover to see the breakdown.</div>
     <div style="padding:8px 14px;font-size:0.8em;font-weight:600">Tags</div><div style="padding:8px 14px;font-size:0.78em;color:#8b949e"><code style="background:#21262d;padding:1px 4px;border-radius:3px">stream</code> streaming · <code style="background:#21262d;padding:1px 4px;border-radius:3px">trimmed</code> context compressed · <code style="background:#21262d;padding:1px 4px;border-radius:3px">→model</code> routed · <code style="background:#21262d;padding:1px 4px;border-radius:3px">cache</code> semantic cache hit</div>
   </div>
 </div>
