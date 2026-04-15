@@ -107,11 +107,15 @@ class ModelRouter {
     async decide(body, requestApiKey) {
         const originalModel = body.model;
         const lastMessage = this.extractLastUserMessage(body);
+        // Conservative mode: never downgrade — honour the requested model exactly
+        if ((this.config.mode ?? 'balanced') === 'conservative') {
+            return { selectedModel: originalModel, reason: 'conservative mode', downgraded: false };
+        }
         // No message text — keep original
         if (!lastMessage.trim()) {
             return { selectedModel: originalModel, reason: 'no message text', downgraded: false };
         }
-        // Pre-classify locally — no API call needed
+        // Pre-classify locally — instant, no API call
         const preClass = this.preClassify(body, lastMessage);
         if (preClass) {
             const finalModel = this.applyConstraints(this.complexityToModel(preClass), originalModel);
@@ -121,7 +125,7 @@ class ModelRouter {
                 downgraded: this.modelRank(finalModel) < this.modelRank(originalModel),
             };
         }
-        // Check classifier cache first (hash of last user message)
+        // Check classifier cache (hash of last user message) — instant
         const cacheKey = simpleHash(lastMessage.slice(0, 500));
         const cached = this.classifierCache.get(cacheKey);
         if (cached) {
@@ -132,33 +136,24 @@ class ModelRouter {
                 downgraded: this.modelRank(finalModel) < this.modelRank(originalModel),
             };
         }
-        // Classify via Haiku — prefer key from the incoming request so the proxy
-        // works even when claudeOptimizer.anthropicApiKey is not configured in settings
+        // No cache hit — fire classification in the background (zero latency for this request).
+        // The result will be cached and applied to the NEXT identical/similar message.
         const apiKey = requestApiKey || this.config.apiKey || process.env.ANTHROPIC_API_KEY || '';
-        if (!apiKey) {
-            return { selectedModel: originalModel, reason: 'no api key for classifier', downgraded: false };
+        if (apiKey) {
+            this.classifyInBackground(lastMessage, cacheKey, apiKey);
         }
-        let complexity;
-        try {
-            complexity = await withTimeout(this.classify(lastMessage, apiKey), 4000);
-        }
-        catch (err) {
-            console.warn('[ModelRouter] Classifier skipped (timeout or error):', err.message);
-            return { selectedModel: originalModel, reason: 'classifier skipped', downgraded: false };
-        }
-        // Store in cache, evict oldest if at capacity
-        if (this.classifierCache.size >= ModelRouter.CLASSIFIER_CACHE_MAX) {
-            this.classifierCache.delete(this.classifierCache.keys().next().value);
-        }
-        this.classifierCache.set(cacheKey, complexity);
-        const targetModel = this.complexityToModel(complexity);
-        const finalModel = this.applyConstraints(targetModel, originalModel);
-        const downgraded = this.modelRank(finalModel) < this.modelRank(originalModel);
-        return {
-            selectedModel: finalModel,
-            reason: `classifier: ${complexity}`,
-            downgraded,
-        };
+        return { selectedModel: originalModel, reason: 'classifier pending (background)', downgraded: false };
+    }
+    /** Fire-and-forget: classifies the message and stores the result in cache. */
+    classifyInBackground(message, cacheKey, apiKey) {
+        withTimeout(this.classify(message, apiKey), 4000)
+            .then(complexity => {
+            if (this.classifierCache.size >= ModelRouter.CLASSIFIER_CACHE_MAX) {
+                this.classifierCache.delete(this.classifierCache.keys().next().value);
+            }
+            this.classifierCache.set(cacheKey, complexity);
+        })
+            .catch(() => { });
     }
     /**
      * Fast local pre-classification — returns a complexity level when the request
@@ -210,10 +205,15 @@ class ModelRouter {
         return 'moderate'; // default to moderate if unclear
     }
     complexityToModel(complexity) {
+        const mode = this.config.mode ?? 'balanced';
         switch (complexity) {
-            case 'simple': return 'claude-haiku-4-5-20251001';
-            case 'moderate': return 'claude-sonnet-4-6';
-            case 'complex': return this.config.allowOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
+            case 'simple':
+                return 'claude-haiku-4-5-20251001';
+            case 'moderate':
+                // aggressive: route moderate tasks to Haiku too (max savings, may reduce quality)
+                return mode === 'aggressive' ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-4-6';
+            case 'complex':
+                return this.config.allowOpus ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
         }
     }
     applyConstraints(targetModel, _originalModel) {
