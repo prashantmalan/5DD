@@ -151,6 +151,8 @@ export class DashboardServer {
   .g { background: #0d2b13; color: #3fb950; }
   .b { background: #0d1b2e; color: #58a6ff; }
   .r { background: #2b0d0d; color: #f85149; }
+  .y { background: #2b1d0d; color: #e3b341; }
+  .dim { background: #1c2128; color: #8b949e; }
   code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 0.88em; }
   .actions { margin-top: 20px; display: flex; gap: 8px; flex-wrap: wrap; }
   button { background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 7px 16px; border-radius: 6px; cursor: pointer; font-size: 0.85em; }
@@ -355,19 +357,39 @@ function renderTraces(traces) {
   const rows = traces.slice(0, 15);
   tbody.innerHTML = rows.map((r, i) => {
     const isNew = !knownIds.has(r.id || i);
+    const techs = r.techniques || [];
     const tags = [];
     if (r.finalModel !== r.originalModel) tags.push('<span class="badge b">→' + (r.finalModel||'').replace('claude-','') + '</span>');
-    if ((r.techniques||[]).includes('context-trim')) tags.push('<span class="badge r">trimmed</span>');
-    if (r.streaming) tags.push('<span class="badge b">stream</span>');
-    if (r.cacheHit) tags.push('<span class="badge g">cache</span>');
-    const savedTok = (r.savedByCompression||0) > 0 ? fmt(r.savedByCompression) : '—';
-    return '<tr class="' + (isNew ? 'new-row' : '') + '">' +
+    if (r.cacheHit)                        tags.push('<span class="badge g">cache-hit</span>');
+    if (techs.includes('pii-redact'))      tags.push('<span class="badge r">pii</span>');
+    if (techs.includes('context-trim'))    tags.push('<span class="badge r">trimmed</span>');
+    if (techs.includes('whitespace-compression') || techs.includes('tool-result-trim') || techs.includes('content-dedup'))
+                                           tags.push('<span class="badge y">compressed</span>');
+    if (r.streaming)                       tags.push('<span class="badge dim">stream</span>');
+
+    const saved = r.savedByCompression || 0;
+    const cacheR = r.cacheReadTokens || 0;
+    const cacheC = r.cacheCreationTokens || 0;
+
+    // token breakdown tooltip: in | out | cache↑ | cache↓ | saved
+    const tokenDetail = [
+      'in: ' + fmt(r.inputTokens),
+      'out: ' + fmt(r.outputTokens),
+      cacheC > 0 ? 'cache-write: ' + fmt(cacheC) : '',
+      cacheR > 0 ? 'cache-read: '  + fmt(cacheR)  : '',
+      saved > 0  ? 'saved: '       + fmt(saved)    : '',
+    ].filter(Boolean).join(' · ');
+
+    return '<tr class="' + (isNew ? 'new-row' : '') + '" title="' + tokenDetail + '">' +
       '<td style="color:#8b949e">' + ago(r.timestamp) + '</td>' +
       '<td><code>' + (r.finalModel||'').replace('claude-','') + '</code></td>' +
-      '<td>' + fmt(r.inputTokens) + '</td>' +
+      '<td>' + fmt(r.inputTokens) +
+        (cacheC > 0 ? ' <span style="color:#e3b341;font-size:0.75em" title="cache write">+' + fmt(cacheC) + '↑</span>' : '') +
+        (cacheR > 0 ? ' <span style="color:#58a6ff;font-size:0.75em" title="cache read">+' + fmt(cacheR)  + '↓</span>' : '') +
+      '</td>' +
       '<td>' + fmt(r.outputTokens) + '</td>' +
-      '<td style="color:#3fb950">' + savedTok + '</td>' +
-      '<td>' + (tags.join('') || '—') + '</td>' +
+      '<td style="color:' + (saved > 0 ? '#3fb950' : '#8b949e') + '">' + (saved > 0 ? fmt(saved) : '—') + '</td>' +
+      '<td>' + (tags.join(' ') || '—') + '</td>' +
     '</tr>';
   }).join('');
   knownIds = new Set(rows.map((r,i) => r.id || i));

@@ -341,9 +341,9 @@ export class ProxyServer {
         this.forwardStreaming(req, optimizedBody, res, (inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens) => {
           const finalInputTokens = inputTokens || originalTokens;
           // Savings = tokens we removed via compression only.
-          // input_tokens + cache_creation_input_tokens = total tokens Anthropic processed.
-          // We must NOT count Anthropic's own cache handling as our savings.
-          const actualSavedByCompression = Math.max(0, originalTokens - (finalInputTokens + cacheCreationTokens));
+          // originalTokens ≈ inputTokens + cacheCreationTokens + cacheReadTokens (all tokens in request).
+          // Subtracting all three leaves only tokens the optimizer actually removed.
+          const actualSavedByCompression = Math.max(0, originalTokens - (finalInputTokens + cacheCreationTokens + cacheReadTokens));
           this.stats.record(this.buildStat({
             body: optimizedBody, originalModel, finalModel: optimizedBody.model,
             inputTokens: finalInputTokens, outputTokens,
@@ -371,8 +371,8 @@ export class ProxyServer {
         const outputTokens = response?.usage?.output_tokens ?? 0;
         const cacheReadTokens = response?.usage?.cache_read_input_tokens ?? 0;
         const cacheCreationTokens = response?.usage?.cache_creation_input_tokens ?? 0;
-        // Same fix: don't count Anthropic's own cache creation as our compression savings.
-        const actualSavedByCompression = Math.max(0, originalTokens - (inputTokens + cacheCreationTokens));
+        // Savings = only tokens the optimizer actually removed from the request.
+        const actualSavedByCompression = Math.max(0, originalTokens - (inputTokens + cacheCreationTokens + cacheReadTokens));
 
         if (this.config.enableCache && !response?.error) {
           this.cache.store(optimizedBody, response, inputTokens);
