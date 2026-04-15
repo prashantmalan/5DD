@@ -428,8 +428,8 @@ async function downloadLogs() {
   a.click();
 }
 
-async function clearStats() { await fetch('/clear', { method:'POST' }); poll(); }
-async function clearAll()   { await fetch('/clear', { method:'POST' }); poll(); }
+async function clearStats() { await fetch(PROXY_ORIGIN + '/proxy-clear', { method:'POST' }); poll(); }
+async function clearAll()   { await fetch(PROXY_ORIGIN + '/proxy-clear', { method:'POST' }); poll(); }
 
 poll();
 setInterval(poll, 1500);

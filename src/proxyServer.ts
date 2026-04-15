@@ -196,6 +196,13 @@ export class ProxyServer {
       res.end(JSON.stringify(this.getTraces()));
       return;
     }
+    if (req.url === '/proxy-clear' && req.method === 'POST') {
+      this.stats.clear();
+      this.traces = [];
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
 
     const rawBody = await readBody(req);
 
