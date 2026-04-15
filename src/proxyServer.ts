@@ -270,22 +270,31 @@ export class ProxyServer {
         this.onPiiDetected?.(piiResult.types);
       }
 
-      // 3. Prompt optimization
-      // Note: we track techniques but NOT token savings here — Anthropic's prompt caching
-      // makes our pre-send token count unreliable vs the API-reported input_tokens.
-      if (this.config.enableCompression) {
-        const result = this.optimizer.optimize(optimizedBody);
-        optimizedBody = result.body;
-        techniques.push(...result.techniques);
-      }
+      // 3. Prompt optimization + model routing run in parallel — classifier no longer
+      //    adds serial latency on top of compression work.
+      const reqApiKey =
+        (req.headers['x-api-key'] as string | undefined) ||
+        (req.headers['authorization'] as string | undefined)?.replace(/^Bearer\s+/i, '') ||
+        this.config.apiKey;
 
-      // 4. Model routing
-      if (this.config.enableModelRouter) {
-        const reqApiKey =
-          (req.headers['x-api-key'] as string | undefined) ||
-          (req.headers['authorization'] as string | undefined)?.replace(/^Bearer\s+/i, '') ||
-          this.config.apiKey;
-        const routing = await this.router.route(optimizedBody, reqApiKey);
+      const [, routingResult] = await Promise.all([
+        // Compression (sync but wrapped so it runs concurrently with routing await)
+        Promise.resolve().then(() => {
+          if (this.config.enableCompression) {
+            const result = this.optimizer.optimize(optimizedBody);
+            optimizedBody = result.body;
+            techniques.push(...result.techniques);
+          }
+        }),
+        // Routing (async — makes Haiku classifier call on cache miss)
+        this.config.enableModelRouter
+          ? this.router.route(optimizedBody, reqApiKey)
+          : Promise.resolve(null),
+      ]);
+
+      // 4. Apply routing decision
+      if (this.config.enableModelRouter && routingResult) {
+        const routing = routingResult;
         optimizedBody.model = routing.selectedModel;
         modelDowngraded = routing.downgraded;
         routingReason = routing.reason;

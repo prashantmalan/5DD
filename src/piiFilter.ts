@@ -28,7 +28,6 @@ export interface RedactionResult {
 interface VaultEntry {
   id: string;
   type: string;
-  original: string;
   redacted: string;
   timestamp: number;
 }
@@ -69,7 +68,7 @@ function redactCreditCards(text: string, vault: VaultEntry[]): string {
     const digits = match.replace(/[ \-]/g, '');
     if (digits.length < 13 || digits.length > 19) return match;
     if (!luhn(digits)) return match;
-    return makeToken('credit-card', match, vault);
+    return makeToken('credit-card', vault);
   });
 }
 
@@ -89,11 +88,11 @@ const TYPE_LABEL: Record<string, string> = {
   'credit-card':  'CARD_NUMBER',
 };
 
-function makeToken(type: string, original: string, vault: VaultEntry[]): string {
+function makeToken(type: string, vault: VaultEntry[]): string {
   const id = shortId();
   const label = TYPE_LABEL[type] ?? type.toUpperCase();
   const redacted = `‹${label}_${id}›`;
-  vault.push({ id, type, original, redacted, timestamp: Date.now() });
+  vault.push({ id, type, redacted, timestamp: Date.now() });
   return redacted;
 }
 
@@ -104,10 +103,10 @@ function redactText(text: string, vault: VaultEntry[]): { text: string; count: n
 
   for (const { name, re } of PATTERNS) {
     re.lastIndex = 0;
-    out = out.replace(re, match => {
+    out = out.replace(re, _match => {
       count++;
       types.add(name);
-      return makeToken(name, match, vault);
+      return makeToken(name, vault);
     });
   }
 
