@@ -164,12 +164,26 @@ export class ModelRouter {
    * Returns null to defer to the classifier.
    */
   private preClassify(body: AnthropicRequestBody, lastMessage: string): 'simple' | 'moderate' | null {
-    // Bash / git / log tool results → Haiku can handle the follow-up
+    // Bash / git / log / file-read tool results → Haiku can handle the follow-up
     if (this.hasBashToolResults(body)) return 'simple';
 
-    // Read-only explanation requests — generic keywords, model-agnostic
-    const explainPattern = /\b(explain|describe|understand|summarize|what does|what is|how does|tell me about|overview of|walk me through|clarify|what('s| is) (this|that|the)|show me what)\b/i;
-    if (explainPattern.test(lastMessage) && lastMessage.length < 600) return 'simple';
+    const msg = lastMessage.trim();
+    const short = msg.length < 400;
+
+    // Read-only / explanation requests
+    const explainPattern = /\b(explain|describe|understand|summarize|what does|what is|how does|tell me about|overview of|walk me through|clarify|what('s| is) (this|that|the)|show me what|what are|list (all|the)|which files?|where is|find (the|all)|look(ing)? (at|for)|read (the|this|that)|check (the|this)|show (me )?(the|this|that)?)\b/i;
+    if (explainPattern.test(msg) && short) return 'simple';
+
+    // Very short messages (< 80 chars) that don't contain code-write signals
+    const codeWriteSignal = /\b(write|create|implement|add|build|generate|make|refactor|fix|update|change|edit|modify|delete|remove|migrate|convert|port|rewrite)\b/i;
+    if (msg.length < 80 && !codeWriteSignal.test(msg)) return 'simple';
+
+    // Git/terminal one-liners
+    const terminalPattern = /^(git |npm |yarn |pnpm |ls |cd |cat |pwd |which |echo |curl |grep |find |chmod |mkdir |cp |mv )/i;
+    if (terminalPattern.test(msg) && short) return 'simple';
+
+    // Explicit code-write requests → keep on Sonnet
+    if (codeWriteSignal.test(msg)) return 'moderate';
 
     return null;
   }
