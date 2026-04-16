@@ -342,6 +342,7 @@ function httpsPost(hostname: string, path: string, apiKey: string, body: string)
         'Content-Length': Buffer.byteLength(body),
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
+        'x-steward-internal': '1',  // bypasses proxy optimization loop
       },
     }, (res) => {
       let data = '';

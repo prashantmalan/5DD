@@ -51,6 +51,7 @@ exports.ProxyServer = void 0;
 const http = __importStar(require("http"));
 const https = __importStar(require("https"));
 const piiFilter_1 = require("./piiFilter");
+const contextCompactor_1 = require("./contextCompactor");
 const ANTHROPIC_HOST = 'api.anthropic.com';
 const MAX_TRACES = 200;
 class ProxyServer {
@@ -63,6 +64,7 @@ class ProxyServer {
     constructor(config, cache, optimizer, router, tokenCounter, stats, log) {
         this.server = null;
         this.traces = [];
+        this.compactor = new contextCompactor_1.ContextCompactor();
         this.config = config;
         this.cache = cache;
         this.optimizer = optimizer;
@@ -175,6 +177,11 @@ class ProxyServer {
             return;
         }
         const rawBody = await readBody(req);
+        // Internal calls (classify, summarize) — bypass all optimization to prevent loops
+        if (req.headers['x-steward-internal']) {
+            this.forwardRaw(req, rawBody, res);
+            return;
+        }
         // Master switch OFF → pass through completely unchanged
         if (!this.config.enabled) {
             this.forwardRaw(req, rawBody, res);
@@ -257,6 +264,11 @@ class ProxyServer {
             const reqApiKey = req.headers['x-api-key'] ||
                 req.headers['authorization']?.replace(/^Bearer\s+/i, '') ||
                 this.config.apiKey;
+            // Context compaction — summarize old turns when conversation is long
+            const compaction = this.compactor.compact(optimizedBody, reqApiKey);
+            if (compaction.compacted) {
+                optimizedBody = compaction.body;
+            }
             const [, routingResult] = await Promise.all([
                 // Compression (sync but wrapped so it runs concurrently with routing await)
                 Promise.resolve().then(() => {

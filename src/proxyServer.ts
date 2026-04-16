@@ -21,6 +21,7 @@ import { ModelRouter } from './modelRouter';
 import { TokenCounter, AnthropicRequestBody } from './tokenCounter';
 import { StatsTracker, RequestStat } from './statsTracker';
 import { PiiFilter } from './piiFilter';
+import { ContextCompactor } from './contextCompactor';
 
 const ANTHROPIC_HOST = 'api.anthropic.com';
 const MAX_TRACES = 200;
@@ -69,6 +70,7 @@ export class ProxyServer {
   private config: ProxyConfig;
   private log: (msg: string) => void;
   private traces: MessageTrace[] = [];
+  private compactor = new ContextCompactor();
   // Captured before NetworkInterceptor patches https.request — used for all
   // outgoing Anthropic forwarding so we never loop back into ourselves.
   private readonly httpsRequest: typeof https.request;
@@ -214,6 +216,12 @@ export class ProxyServer {
 
     const rawBody = await readBody(req);
 
+    // Internal calls (classify, summarize) — bypass all optimization to prevent loops
+    if (req.headers['x-steward-internal']) {
+      this.forwardRaw(req, rawBody, res);
+      return;
+    }
+
     // Master switch OFF → pass through completely unchanged
     if (!this.config.enabled) {
       this.forwardRaw(req, rawBody, res);
@@ -305,6 +313,10 @@ export class ProxyServer {
         (req.headers['x-api-key'] as string | undefined) ||
         (req.headers['authorization'] as string | undefined)?.replace(/^Bearer\s+/i, '') ||
         this.config.apiKey;
+
+      // Context compaction — summarize old turns when conversation is long
+      const compaction = this.compactor.compact(optimizedBody, reqApiKey);
+      if (compaction.compacted) { optimizedBody = compaction.body; }
 
       const [, routingResult] = await Promise.all([
         // Compression (sync but wrapped so it runs concurrently with routing await)
