@@ -91,6 +91,7 @@ async function activate(context) {
         apiKey: config.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
         minimumModel: config.get('minimumModel'),
         allowOpus: config.get('allowOpus', false),
+        mode: config.get('modelRouterMode', 'balanced'),
     };
     const router = new modelRouter_1.ModelRouter(routerConfig);
     stats = new statsTracker_1.StatsTracker(context);
@@ -146,6 +147,9 @@ async function activate(context) {
         modelDowngraded: trace.originalModel !== trace.finalModel,
         savedCostUSD: trace.savedCostUSD,
     }));
+    proxy.setOnRestartHost(() => {
+        vscode.commands.executeCommand('workbench.action.restartExtensionHost');
+    });
     let lastPiiWarnAt = 0;
     proxy.setOnPiiDetected(types => {
         const now = Date.now();
@@ -324,6 +328,7 @@ async function activate(context) {
             enableCache: c.get('enableCache'),
             enableCompression: c.get('enablePromptCompression'),
             enableModelRouter: c.get('enableModelRouter'),
+            modelRouterMode: c.get('modelRouterMode', 'balanced'),
         });
         cache.updateThreshold(c.get('cacheThreshold', 0.92));
     }));

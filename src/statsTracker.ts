@@ -19,6 +19,8 @@ export interface RequestStat {
   modelDowngraded: boolean;
   costUSD: number;
   savedCostUSD: number;
+  savedCostByCompression: number;  // portion from token trimming
+  savedCostByRouting: number;      // portion from cheaper model routing
   techniques: string[];
 }
 
@@ -26,9 +28,14 @@ export interface SessionStats {
   totalRequests: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheCreationTokens: number;
   totalSavedTokens: number;
+  totalOriginalTokens: number;     // what would have been sent without our compression
   totalCostUSD: number;
   totalSavedCostUSD: number;
+  totalSavedCostByCompression: number;
+  totalSavedCostByRouting: number;
   cacheHits: number;
   modelDowngrades: number;
   avgSavingsPct: number;
@@ -60,6 +67,8 @@ export class StatsTracker {
     const totalSavedTokens = this.stats.reduce((s, r) => s + r.savedTokensByCompression + r.savedTokensByCache, 0);
     const totalCostUSD = this.stats.reduce((s, r) => s + r.costUSD, 0);
     const totalSavedCostUSD = this.stats.reduce((s, r) => s + r.savedCostUSD, 0);
+    const totalSavedCostByCompression = this.stats.reduce((s, r) => s + (r.savedCostByCompression ?? 0), 0);
+    const totalSavedCostByRouting = this.stats.reduce((s, r) => s + (r.savedCostByRouting ?? 0), 0);
     const cacheHits = this.stats.filter(r => r.cacheHit).length;
     const modelDowngrades = this.stats.filter(r => r.modelDowngraded).length;
 
@@ -68,18 +77,23 @@ export class StatsTracker {
     // when Anthropic's prompt cache is active.
     const totalCacheReadTokens = this.stats.reduce((s, r) => s + (r.cacheHit ? 0 : r.cacheReadTokens), 0);
     const totalCacheCreationTokens = this.stats.reduce((s, r) => s + (r.cacheHit ? 0 : r.cacheCreationTokens), 0);
-    const totalConsumed = totalInputTokens + totalCacheReadTokens + totalCacheCreationTokens + totalSavedTokens;
-    const avgSavingsPct = totalConsumed > 0
-      ? (totalSavedTokens / totalConsumed) * 100
+    const totalOriginalTokens = totalInputTokens + totalCacheReadTokens + totalCacheCreationTokens + totalSavedTokens;
+    const avgSavingsPct = totalOriginalTokens > 0
+      ? (totalSavedTokens / totalOriginalTokens) * 100
       : 0;
 
     return {
       totalRequests,
       totalInputTokens,
       totalOutputTokens,
+      totalCacheReadTokens,
+      totalCacheCreationTokens,
       totalSavedTokens,
+      totalOriginalTokens,
       totalCostUSD,
       totalSavedCostUSD,
+      totalSavedCostByCompression,
+      totalSavedCostByRouting,
       cacheHits,
       modelDowngrades,
       avgSavingsPct,

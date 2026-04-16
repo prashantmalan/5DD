@@ -57,14 +57,9 @@ class ProxyServer {
     getTraces(n = 50) {
         return this.traces.slice(-n).reverse();
     }
-    /** Register a callback invoked whenever a trace is recorded (for real-time SSE push). */
-    setOnTrace(cb) {
-        this.onTrace = cb;
-    }
-    /** Register a callback invoked when PII is redacted (for VS Code warning). */
-    setOnPiiDetected(cb) {
-        this.onPiiDetected = cb;
-    }
+    setOnTrace(cb) { this.onTrace = cb; }
+    setOnPiiDetected(cb) { this.onPiiDetected = cb; }
+    setOnRestartHost(cb) { this.onRestartHost = cb; }
     constructor(config, cache, optimizer, router, tokenCounter, stats, log) {
         this.server = null;
         this.traces = [];
@@ -136,6 +131,9 @@ class ProxyServer {
     updateConfig(config) {
         this.config = { ...this.config, ...config };
         this.router.setEnabled(config.enableModelRouter ?? this.config.enableModelRouter);
+        if (config.modelRouterMode !== undefined) {
+            this.router.setConfig({ mode: config.modelRouterMode });
+        }
     }
     toggle() {
         this.config.enabled = !this.config.enabled;
@@ -149,6 +147,31 @@ class ProxyServer {
         if (req.url === '/health' && req.method === 'GET') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, port: this.config.port }));
+            return;
+        }
+        // Stats/traces served from the proxy port so multi-window ownership works:
+        // whoever owns :8787 also owns the authoritative stats.
+        if (req.url === '/proxy-stats' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify(this.stats.getSessionStats()));
+            return;
+        }
+        if (req.url === '/proxy-traces' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify(this.getTraces()));
+            return;
+        }
+        if (req.url === '/proxy-clear' && req.method === 'POST') {
+            this.stats.clear();
+            this.traces = [];
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+        }
+        if (req.url === '/proxy-restart-host' && req.method === 'POST') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify({ ok: true }));
+            setTimeout(() => this.onRestartHost?.(), 300);
             return;
         }
         const rawBody = await readBody(req);
@@ -198,6 +221,7 @@ class ProxyServer {
         const requestStart = Date.now();
         // Hoisted so the streaming callback (outside the try block) can read it.
         let originalTokens = this.tokenCounter.countRequest(body).prompt;
+        let compressedTokens = originalTokens;
         try {
             // Token count (re-use the already-computed value above)
             this.log(`[VIA PROXY] tokens=${originalTokens}`);
@@ -228,20 +252,29 @@ class ProxyServer {
                 techniques.push('pii-redact');
                 this.onPiiDetected?.(piiResult.types);
             }
-            // 3. Prompt optimization
-            // Note: we track techniques but NOT token savings here — Anthropic's prompt caching
-            // makes our pre-send token count unreliable vs the API-reported input_tokens.
-            if (this.config.enableCompression) {
-                const result = this.optimizer.optimize(optimizedBody);
-                optimizedBody = result.body;
-                techniques.push(...result.techniques);
-            }
-            // 4. Model routing
-            if (this.config.enableModelRouter) {
-                const reqApiKey = req.headers['x-api-key'] ||
-                    req.headers['authorization']?.replace(/^Bearer\s+/i, '') ||
-                    this.config.apiKey;
-                const routing = await this.router.route(optimizedBody, reqApiKey);
+            // 3. Prompt optimization + model routing run in parallel — classifier no longer
+            //    adds serial latency on top of compression work.
+            const reqApiKey = req.headers['x-api-key'] ||
+                req.headers['authorization']?.replace(/^Bearer\s+/i, '') ||
+                this.config.apiKey;
+            const [, routingResult] = await Promise.all([
+                // Compression (sync but wrapped so it runs concurrently with routing await)
+                Promise.resolve().then(() => {
+                    if (this.config.enableCompression) {
+                        const result = this.optimizer.optimize(optimizedBody);
+                        optimizedBody = result.body;
+                        techniques.push(...result.techniques);
+                        compressedTokens = this.tokenCounter.countRequest(optimizedBody).prompt;
+                    }
+                }),
+                // Routing (async — makes Haiku classifier call on cache miss)
+                this.config.enableModelRouter
+                    ? this.router.route(optimizedBody, reqApiKey)
+                    : Promise.resolve(null),
+            ]);
+            // 4. Apply routing decision
+            if (this.config.enableModelRouter && routingResult) {
+                const routing = routingResult;
                 optimizedBody.model = routing.selectedModel;
                 modelDowngraded = routing.downgraded;
                 routingReason = routing.reason;
@@ -286,7 +319,7 @@ class ProxyServer {
             optimizedBody = body;
         }
         // Sanitize is now done at every forward point (forwardRaw, forwardToAnthropic, forwardStreaming)
-        this.log(`[VIA PROXY → ANTHROPIC] model=${optimizedBody.model}${modelDowngraded ? ` (routed from ${originalModel})` : ''} tokens=${this.tokenCounter.countRequest(optimizedBody).prompt}`);
+        this.log(`[VIA PROXY → ANTHROPIC] model=${optimizedBody.model}${modelDowngraded ? ` (routed from ${originalModel})` : ''}`);
         // ── FORWARD ──────────────────────────────────────────────────────────────
         // If anything goes wrong forwarding the optimized body, fall back to the
         // original raw request as an absolute last resort.
@@ -294,10 +327,8 @@ class ProxyServer {
             if (isStreaming) {
                 this.forwardStreaming(req, optimizedBody, res, (inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens) => {
                     const finalInputTokens = inputTokens || originalTokens;
-                    // Mirror the non-streaming savings computation: compare pre-optimization token
-                    // estimate against what the API actually billed (input_tokens only; cache reads
-                    // are already a form of savings tracked separately).
-                    const actualSavedByCompression = Math.max(0, originalTokens - finalInputTokens);
+                    // Savings = what our optimizer removed (before vs after compression), not Anthropic's cache discount.
+                    const actualSavedByCompression = Math.max(0, originalTokens - compressedTokens);
                     this.stats.record(this.buildStat({
                         body: optimizedBody, originalModel, finalModel: optimizedBody.model,
                         inputTokens: finalInputTokens, outputTokens,
@@ -324,7 +355,8 @@ class ProxyServer {
                 const outputTokens = response?.usage?.output_tokens ?? 0;
                 const cacheReadTokens = response?.usage?.cache_read_input_tokens ?? 0;
                 const cacheCreationTokens = response?.usage?.cache_creation_input_tokens ?? 0;
-                const actualSavedByCompression = Math.max(0, originalTokens - inputTokens);
+                // Savings = what our optimizer removed (before vs after compression), not Anthropic's cache discount.
+                const actualSavedByCompression = Math.max(0, originalTokens - compressedTokens);
                 if (this.config.enableCache && !response?.error) {
                     this.cache.store(optimizedBody, response, inputTokens);
                 }
@@ -426,30 +458,40 @@ class ProxyServer {
                     return;
                 }
                 res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-                let buffer = '';
                 let inputTokens = 0;
                 let outputTokens = 0;
                 let cacheReadTokens = 0;
                 let cacheCreationTokens = 0;
+                // tail: sliding 2KB window used only for output_tokens (last occurrence wins).
+                // input/cache tokens appear once near stream start — captured per-chunk before sliding.
+                let tail = '';
                 proxyRes.on('data', (chunk) => {
                     res.write(chunk);
-                    buffer += chunk.toString();
-                    // Parse usage fields from SSE events:
-                    //   message_start carries input_tokens and cache counts (appear once)
-                    //   message_delta carries the FINAL output_tokens (use last match since
-                    //   message_start also emits output_tokens: 1 which would shadow the real count)
-                    const inputMatch = buffer.match(/"input_tokens":(\d+)/);
-                    const outputMatches = [...buffer.matchAll(/"output_tokens":(\d+)/g)];
-                    const cacheReadMatch = buffer.match(/"cache_read_input_tokens":(\d+)/);
-                    const cacheCreateMatch = buffer.match(/"cache_creation_input_tokens":(\d+)/);
-                    if (inputMatch)
-                        inputTokens = parseInt(inputMatch[1]);
-                    if (outputMatches.length > 0)
-                        outputTokens = parseInt(outputMatches[outputMatches.length - 1][1]);
-                    if (cacheReadMatch)
-                        cacheReadTokens = parseInt(cacheReadMatch[1]);
-                    if (cacheCreateMatch)
-                        cacheCreationTokens = parseInt(cacheCreateMatch[1]);
+                    const str = chunk.toString();
+                    // Capture start-of-stream fields on first occurrence (appear in message_start)
+                    if (inputTokens === 0) {
+                        const m = str.match(/"input_tokens":(\d+)/);
+                        if (m)
+                            inputTokens = parseInt(m[1]);
+                    }
+                    if (cacheReadTokens === 0) {
+                        const m = str.match(/"cache_read_input_tokens":(\d+)/);
+                        if (m)
+                            cacheReadTokens = parseInt(m[1]);
+                    }
+                    if (cacheCreationTokens === 0) {
+                        const m = str.match(/"cache_creation_input_tokens":(\d+)/);
+                        if (m)
+                            cacheCreationTokens = parseInt(m[1]);
+                    }
+                    // output_tokens: keep last value seen (message_delta overwrites message_start's placeholder)
+                    tail = (tail + str).slice(-2048);
+                    const om = tail.match(/(?:.*"output_tokens":(\d+))/s);
+                    if (om) {
+                        const v = parseInt(om[1]);
+                        if (v > outputTokens)
+                            outputTokens = v;
+                    }
                 });
                 proxyRes.on('end', () => { res.end(); onDone(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens); });
                 proxyRes.on('error', () => res.end());
@@ -634,6 +676,7 @@ class ProxyServer {
                 : '';
             this.log(`[route] ${params.originalModel.replace('claude-', '')} → ${params.finalModel.replace('claude-', '')} | reason: ${params.routingReason} | saved $${routingSavings.toFixed(4)}${pct}`);
         }
+        const originalTokens = params.inputTokens + params.cacheReadTokens + params.cacheCreationTokens + params.savedByCompression;
         const trace = {
             id: Math.random().toString(36).slice(2, 8),
             timestamp: Date.now(),
@@ -645,7 +688,10 @@ class ProxyServer {
             cacheReadTokens: params.cacheReadTokens,
             cacheCreationTokens: params.cacheCreationTokens,
             savedByCompression: params.savedByCompression,
+            originalTokens,
             savedCostUSD,
+            savedCostByCompression: compressionSavings,
+            savedCostByRouting: routingSavings,
             techniques: params.techniques,
             streaming: params.streaming,
             durationMs: Date.now() - params.requestStart,
@@ -664,7 +710,9 @@ class ProxyServer {
         // because it happens regardless of whether this extension is running):
         //   1. Model routing:  cheaper model selected → delta between original and final model cost
         //   2. Compression:    tokens eliminated before sending → saved at original model's input rate
-        const savedCostUSD = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens) + (params.savedByCompression / 1000000) * this.router.inputPriceFor(params.originalModel);
+        const savedCostByRouting = this.router.estimateSavings(params.originalModel, params.finalModel, params.inputTokens, params.outputTokens, params.cacheReadTokens, params.cacheCreationTokens);
+        const savedCostByCompression = (params.savedByCompression / 1000000) * this.router.inputPriceFor(params.originalModel);
+        const savedCostUSD = savedCostByRouting + savedCostByCompression;
         return {
             timestamp: Date.now(),
             model: params.finalModel,
@@ -679,6 +727,8 @@ class ProxyServer {
             modelDowngraded: params.modelDowngraded,
             costUSD,
             savedCostUSD,
+            savedCostByCompression,
+            savedCostByRouting,
             techniques: params.techniques,
         };
     }

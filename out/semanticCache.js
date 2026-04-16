@@ -48,7 +48,7 @@ class SemanticCache {
         for (const entry of this.entries) {
             if (entry.request.model !== body.model)
                 continue;
-            const entryVec = this.tfidfVector(entry.promptText, N);
+            const entryVec = this.tfidfVectorFromTf(entry.cachedTf, N);
             const sim = cosineSimilarity(queryVec, entryVec);
             if (sim > bestSimilarity) {
                 bestSimilarity = sim;
@@ -81,6 +81,7 @@ class SemanticCache {
             response,
             promptKey: key,
             promptText,
+            cachedTf: buildTf(promptText),
             tokens,
             timestamp: Date.now(),
             hits: 0
@@ -143,17 +144,17 @@ class SemanticCache {
         }
         return '';
     }
-    /** TF-IDF vector using precomputed `this.termDf` — O(terms), not O(N*terms) */
+    /** TF-IDF vector from raw text — used for the query vector at lookup time */
     tfidfVector(text, N) {
-        const tokens = tokenize(text);
-        const tf = new Map();
-        for (const t of tokens)
-            tf.set(t, (tf.get(t) ?? 0) + 1);
+        return this.tfidfVectorFromTf(buildTf(text), N);
+    }
+    /** TF-IDF vector from a pre-computed TF map — used for cached entries (no re-tokenizing) */
+    tfidfVectorFromTf(tf, N) {
         const vector = new Map();
-        for (const [term, count] of tf) {
-            const df = (this.termDf.get(term) ?? 0) + 1; // +1 smoothing
+        for (const [term, freq] of tf) {
+            const df = (this.termDf.get(term) ?? 0) + 1;
             const idf = Math.log(N / df);
-            vector.set(term, (count / tokens.length) * idf);
+            vector.set(term, freq * idf);
         }
         return vector;
     }
@@ -162,13 +163,24 @@ class SemanticCache {
     }
 }
 exports.SemanticCache = SemanticCache;
-// --- Cosine Similarity ---
+// --- Helpers ---
 function tokenize(text) {
     return text
         .toLowerCase()
         .replace(/[^\w\s]/g, ' ')
         .split(/\s+/)
         .filter(t => t.length > 2);
+}
+/** Build normalized TF map from text — stored on entry at write-time */
+function buildTf(text) {
+    const tokens = tokenize(text);
+    const tf = new Map();
+    for (const t of tokens)
+        tf.set(t, (tf.get(t) ?? 0) + 1);
+    // Normalize by total token count so frequency is comparable across entries of different lengths
+    for (const [t, c] of tf)
+        tf.set(t, c / (tokens.length || 1));
+    return tf;
 }
 function cosineSimilarity(a, b) {
     let dot = 0;

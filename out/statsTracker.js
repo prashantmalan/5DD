@@ -60,19 +60,31 @@ class StatsTracker {
         const totalSavedTokens = this.stats.reduce((s, r) => s + r.savedTokensByCompression + r.savedTokensByCache, 0);
         const totalCostUSD = this.stats.reduce((s, r) => s + r.costUSD, 0);
         const totalSavedCostUSD = this.stats.reduce((s, r) => s + r.savedCostUSD, 0);
+        const totalSavedCostByCompression = this.stats.reduce((s, r) => s + (r.savedCostByCompression ?? 0), 0);
+        const totalSavedCostByRouting = this.stats.reduce((s, r) => s + (r.savedCostByRouting ?? 0), 0);
         const cacheHits = this.stats.filter(r => r.cacheHit).length;
         const modelDowngrades = this.stats.filter(r => r.modelDowngraded).length;
-        const totalConsumed = totalInputTokens + totalSavedTokens;
-        const avgSavingsPct = totalConsumed > 0
-            ? (totalSavedTokens / totalConsumed) * 100
+        // Full request size = fresh + cache tokens + what we removed via compression/cache.
+        // Using just inputTokens (fresh only) in the denominator inflates the savings rate
+        // when Anthropic's prompt cache is active.
+        const totalCacheReadTokens = this.stats.reduce((s, r) => s + (r.cacheHit ? 0 : r.cacheReadTokens), 0);
+        const totalCacheCreationTokens = this.stats.reduce((s, r) => s + (r.cacheHit ? 0 : r.cacheCreationTokens), 0);
+        const totalOriginalTokens = totalInputTokens + totalCacheReadTokens + totalCacheCreationTokens + totalSavedTokens;
+        const avgSavingsPct = totalOriginalTokens > 0
+            ? (totalSavedTokens / totalOriginalTokens) * 100
             : 0;
         return {
             totalRequests,
             totalInputTokens,
             totalOutputTokens,
+            totalCacheReadTokens,
+            totalCacheCreationTokens,
             totalSavedTokens,
+            totalOriginalTokens,
             totalCostUSD,
             totalSavedCostUSD,
+            totalSavedCostByCompression,
+            totalSavedCostByRouting,
             cacheHits,
             modelDowngrades,
             avgSavingsPct,

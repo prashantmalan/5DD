@@ -24,6 +24,8 @@ function makeStat(overrides: Partial<RequestStat> = {}): RequestStat {
     modelDowngraded: false,
     costUSD: 0.001,
     savedCostUSD: 0,
+    savedCostByCompression: 0,
+    savedCostByRouting: 0,
     techniques: [],
     ...overrides,
   };
