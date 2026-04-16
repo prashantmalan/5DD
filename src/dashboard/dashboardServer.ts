@@ -274,6 +274,7 @@ export class DashboardServer {
   <button class="dl" onclick="downloadLogs()">Download logs (CSV)</button>
   <button onclick="clearStats()">Clear stats</button>
   <button class="danger" onclick="clearAll()">Clear all proxy state</button>
+  <button onclick="routeAllWindows()" title="Restarts the VS Code extension host so all existing Claude Code chat windows route through the proxy">Route all windows ↺</button>
 </div>
 
 <div class="status" id="proxy-status-bar"><span id="proxy-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#8b949e;margin-right:5px"></span><span id="proxy-status-text">Connecting to proxy…</span> · <a href="#how-it-works" style="color:#58a6ff;text-decoration:none">How it works ↓</a></div>
@@ -395,7 +396,7 @@ let knownIds = new Set();
 function renderTraces(traces) {
   const tbody = document.getElementById('tbody');
   if (!traces.length) {
-    tbody.innerHTML = '<tr><td colspan="8" style="color:#8b949e;padding:16px 10px">No requests yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e;padding:16px 10px">No requests yet — send a message in a <strong style="color:#e6edf3">new</strong> Claude Code chat window to start seeing data.</td></tr>';
     knownIds = new Set();
     return;
   }
@@ -502,6 +503,12 @@ async function downloadLogs() {
 
 async function clearStats() { await fetch(PROXY_ORIGIN + '/proxy-clear', { method:'POST' }); poll(); }
 async function clearAll()   { await fetch(PROXY_ORIGIN + '/proxy-clear', { method:'POST' }); poll(); }
+async function routeAllWindows() {
+  if (!confirm('This restarts the VS Code extension host.\\nAll existing Claude Code chat windows will route through the proxy after restart.\\nIn-progress responses will be interrupted.\\n\\nContinue?')) return;
+  const txt = document.getElementById('proxy-status-text');
+  if (txt) txt.textContent = 'Restarting extension host…';
+  await fetch(PROXY_ORIGIN + '/proxy-restart-host', { method:'POST' }).catch(() => {});
+}
 
 poll();
 setInterval(poll, 1500);

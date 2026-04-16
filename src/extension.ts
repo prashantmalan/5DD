@@ -65,6 +65,7 @@ export async function activate(context: vscode.ExtensionContext) {
     apiKey: config.get<string>('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
     minimumModel: config.get<string | undefined>('minimumModel'),
     allowOpus: config.get<boolean>('allowOpus', false),
+    mode: config.get<'balanced' | 'aggressive' | 'conservative'>('modelRouterMode', 'balanced'),
   };
   const router = new ModelRouter(routerConfig);
   stats = new StatsTracker(context);
@@ -135,6 +136,9 @@ export async function activate(context: vscode.ExtensionContext) {
     modelDowngraded: trace.originalModel !== trace.finalModel,
     savedCostUSD: trace.savedCostUSD,
   }));
+  proxy.setOnRestartHost(() => {
+    vscode.commands.executeCommand('workbench.action.restartExtensionHost');
+  });
   let lastPiiWarnAt = 0;
   proxy.setOnPiiDetected(types => {
     const now = Date.now();
@@ -334,6 +338,7 @@ export async function activate(context: vscode.ExtensionContext) {
         enableCache: c.get('enableCache'),
         enableCompression: c.get('enablePromptCompression'),
         enableModelRouter: c.get('enableModelRouter'),
+        modelRouterMode: c.get<'balanced' | 'aggressive' | 'conservative'>('modelRouterMode', 'balanced'),
       });
       cache.updateThreshold(c.get<number>('cacheThreshold', 0.92));
     })

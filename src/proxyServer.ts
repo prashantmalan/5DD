@@ -36,7 +36,10 @@ export interface MessageTrace {
   cacheReadTokens: number;
   cacheCreationTokens: number;
   savedByCompression: number;
-  savedCostUSD: number;   // total savings for this request (routing + compression + cache)
+  originalTokens: number;    // full size before our compression (= actual + savedByCompression)
+  savedCostUSD: number;      // total savings: routing + compression
+  savedCostByCompression: number;  // portion of savedCostUSD from token trimming
+  savedCostByRouting: number;      // portion of savedCostUSD from cheaper model
   techniques: string[];
   streaming: boolean;
   durationMs: number;
@@ -51,6 +54,7 @@ export interface ProxyConfig {
   enableCompression: boolean;
   enableModelRouter: boolean;
   enablePiiRedaction: boolean;
+  modelRouterMode?: 'balanced' | 'aggressive' | 'conservative';
   apiKey: string;
 }
 
@@ -70,20 +74,15 @@ export class ProxyServer {
   private readonly httpsRequest: typeof https.request;
   private onTrace?: (trace: MessageTrace) => void;
   private onPiiDetected?: (types: string[]) => void;
+  private onRestartHost?: () => void;
 
   getTraces(n = 50): MessageTrace[] {
     return this.traces.slice(-n).reverse();
   }
 
-  /** Register a callback invoked whenever a trace is recorded (for real-time SSE push). */
-  setOnTrace(cb: (trace: MessageTrace) => void): void {
-    this.onTrace = cb;
-  }
-
-  /** Register a callback invoked when PII is redacted (for VS Code warning). */
-  setOnPiiDetected(cb: (types: string[]) => void): void {
-    this.onPiiDetected = cb;
-  }
+  setOnTrace(cb: (trace: MessageTrace) => void): void { this.onTrace = cb; }
+  setOnPiiDetected(cb: (types: string[]) => void): void { this.onPiiDetected = cb; }
+  setOnRestartHost(cb: () => void): void { this.onRestartHost = cb; }
 
   constructor(
     config: ProxyConfig,
@@ -165,6 +164,9 @@ export class ProxyServer {
   updateConfig(config: Partial<ProxyConfig>): void {
     this.config = { ...this.config, ...config };
     this.router.setEnabled(config.enableModelRouter ?? this.config.enableModelRouter);
+    if (config.modelRouterMode !== undefined) {
+      this.router.setConfig({ mode: config.modelRouterMode });
+    }
   }
 
   toggle(): boolean {
@@ -201,6 +203,12 @@ export class ProxyServer {
       this.traces = [];
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (req.url === '/proxy-restart-host' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true }));
+      setTimeout(() => this.onRestartHost?.(), 300);
       return;
     }
 
@@ -746,6 +754,7 @@ export class ProxyServer {
       this.log(`[route] ${params.originalModel.replace('claude-','')} → ${params.finalModel.replace('claude-','')} | reason: ${params.routingReason} | saved $${routingSavings.toFixed(4)}${pct}`);
     }
 
+    const originalTokens = params.inputTokens + params.cacheReadTokens + params.cacheCreationTokens + params.savedByCompression;
     const trace: MessageTrace = {
       id: Math.random().toString(36).slice(2, 8),
       timestamp: Date.now(),
@@ -757,7 +766,10 @@ export class ProxyServer {
       cacheReadTokens: params.cacheReadTokens,
       cacheCreationTokens: params.cacheCreationTokens,
       savedByCompression: params.savedByCompression,
+      originalTokens,
       savedCostUSD,
+      savedCostByCompression: compressionSavings,
+      savedCostByRouting: routingSavings,
       techniques: params.techniques,
       streaming: params.streaming,
       durationMs: Date.now() - params.requestStart,
@@ -793,11 +805,13 @@ export class ProxyServer {
     // because it happens regardless of whether this extension is running):
     //   1. Model routing:  cheaper model selected → delta between original and final model cost
     //   2. Compression:    tokens eliminated before sending → saved at original model's input rate
-    const savedCostUSD = this.router.estimateSavings(
+    const savedCostByRouting = this.router.estimateSavings(
       params.originalModel, params.finalModel,
       params.inputTokens, params.outputTokens,
       params.cacheReadTokens, params.cacheCreationTokens,
-    ) + (params.savedByCompression / 1_000_000) * this.router.inputPriceFor(params.originalModel);
+    );
+    const savedCostByCompression = (params.savedByCompression / 1_000_000) * this.router.inputPriceFor(params.originalModel);
+    const savedCostUSD = savedCostByRouting + savedCostByCompression;
 
     return {
       timestamp: Date.now(),
@@ -813,6 +827,8 @@ export class ProxyServer {
       modelDowngraded: params.modelDowngraded,
       costUSD,
       savedCostUSD,
+      savedCostByCompression,
+      savedCostByRouting,
       techniques: params.techniques,
     };
   }
