@@ -50,11 +50,12 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.DashboardServer = void 0;
 const http = __importStar(require("http"));
 class DashboardServer {
-    constructor(stats, port = 8788, getTraces) {
+    constructor(stats, port = 8788, getTraces, proxyPort = 8787) {
         this.server = null;
         this.sseClients = [];
         this.stats = stats;
         this.port = port;
+        this.proxyPort = proxyPort;
         this.getTraces = getTraces ?? (() => []);
     }
     /** Push a real-time event to all SSE listeners */
@@ -74,6 +75,15 @@ class DashboardServer {
         return new Promise((resolve, reject) => {
             this.server = http.createServer((req, res) => {
                 const url = req.url?.split('?')[0];
+                if (req.method === 'OPTIONS') {
+                    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST', 'Access-Control-Allow-Headers': '*' });
+                    res.end();
+                    return;
+                }
+                if ((url === '/proxy-clear' || url === '/proxy-restart-host') && req.method === 'POST') {
+                    this.relayToProxy('POST', url, res);
+                    return;
+                }
                 if (url === '/stats' && req.method === 'GET') {
                     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
                     res.end(JSON.stringify(this.stats.getSessionStats()));
@@ -119,6 +129,21 @@ class DashboardServer {
             });
         });
     }
+    relayToProxy(method, path, res) {
+        const proxyReq = http.request({ hostname: '127.0.0.1', port: this.proxyPort, path, method }, proxyRes => {
+            let data = '';
+            proxyRes.on('data', (c) => { data += c; });
+            proxyRes.on('end', () => {
+                res.writeHead(proxyRes.statusCode || 200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+                res.end(data);
+            });
+        });
+        proxyReq.on('error', () => {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false }));
+        });
+        proxyReq.end();
+    }
     stop() {
         this.server?.close();
         this.server = null;
@@ -144,25 +169,14 @@ class DashboardServer {
   .privacy { background: #f0fdf4; border: 1px solid #bbf7d0; border-left: 3px solid #16a34a; border-radius: 6px; padding: 10px 14px; font-size: 0.78em; color: #15803d; margin-bottom: 8px; }
   .estimate-note { background: #fffbeb; border: 1px solid #fde68a; border-left: 3px solid #d97706; border-radius: 6px; padding: 8px 14px; font-size: 0.75em; color: #92400e; margin-bottom: 20px; }
   .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
-  .card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; transition: border-color 0.3s; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; transition: border-color 0.3s; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
   .card.pulse { border-color: #16a34a; animation: cardpulse 0.8s ease-out; }
   @keyframes cardpulse { 0%{box-shadow:0 0 0 0 rgba(22,163,74,0.4)} 70%{box-shadow:0 0 0 8px rgba(22,163,74,0)} 100%{box-shadow:0 1px 3px rgba(0,0,0,0.06)} }
-  .card .label { font-size: 0.72em; color: #6b7280; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
-  .card .value { font-size: 2em; font-weight: 700; color: #16a34a; transition: transform 0.2s; }
+  .card .label { font-size: 0.72em; color: #6b7280; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .card .value { font-size: 1.4em; font-weight: 700; color: #16a34a; transition: transform 0.2s; }
   .card .value.bump { transform: scale(1.12); }
-  .card .hint  { font-size: 0.72em; color: #6b7280; margin-top: 4px; }
+  .card .hint  { font-size: 0.72em; color: #6b7280; margin-top: 2px; }
 
-  /* Mini live flow strip */
-  .liveflow { display: flex; align-items: center; gap: 0; margin-bottom: 24px; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 16px; overflow-x: auto; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-  .lf-node { display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 70px; }
-  .lf-icon { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.1em; border: 2px solid #e5e7eb; transition: border-color 0.3s, box-shadow 0.3s; background: #f9fafb; }
-  .lf-label { font-size: 0.62em; color: #6b7280; text-align: center; white-space: nowrap; }
-  .lf-arrow { color: #d1d5db; font-size: 1em; margin: 0 2px; margin-bottom: 18px; transition: color 0.3s; }
-  .lf-node.active .lf-icon { border-color: #16a34a; box-shadow: 0 0 10px rgba(22,163,74,0.4); }
-  .lf-arrow.active { color: #16a34a; }
-  .lf-node.active .lf-label { color: #16a34a; }
-  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #16a34a; animation: blink 1.5s infinite; margin-right: 6px; display: inline-block; }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
   table { width: 100%; border-collapse: collapse; font-size: 0.82em; }
   th { text-align: left; padding: 8px 10px; background: #f9fafb; color: #6b7280; font-weight: 500; border-bottom: 1px solid #e5e7eb; cursor: help; }
@@ -196,58 +210,6 @@ class DashboardServer {
 <h1>Claude Steward</h1>
 <div class="sub">5DD Plan — live token savings dashboard</div>
 
-<nav>
-  <a href="/" class="active">Dashboard</a>
-  <a href="/flow">How it works ↗</a>
-</nav>
-
-<div class="privacy">
-  🔒 Privacy: only token counts, costs, and model names are tracked. No prompt content. Nothing leaves <code>localhost</code>.
-</div>
-<div class="estimate-note">
-  ⚠️ <strong>Cost savings are estimates</strong> based on Anthropic's public pricing and the token delta between your original request and what was actually sent. They are not a guarantee of exact billing savings — verify against your <a href="https://console.anthropic.com/settings/billing" style="color:#2563eb" target="_blank">Anthropic console</a>.
-</div>
-
-<!-- Mini live flow strip -->
-<div class="liveflow" id="liveflow">
-  <div class="lf-node" id="lf-vscode">
-    <div class="lf-icon">💻</div>
-    <div class="lf-label">VS Code</div>
-  </div>
-  <div class="lf-arrow" id="arr0">→</div>
-  <div class="lf-node" id="lf-pii">
-    <div class="lf-icon">🔒</div>
-    <div class="lf-label">PII Filter</div>
-  </div>
-  <div class="lf-arrow" id="arr1">→</div>
-  <div class="lf-node" id="lf-cache">
-    <div class="lf-icon">⚡</div>
-    <div class="lf-label">Cache</div>
-  </div>
-  <div class="lf-arrow" id="arr2">→</div>
-  <div class="lf-node" id="lf-opt">
-    <div class="lf-icon">✂️</div>
-    <div class="lf-label">Optimizer</div>
-  </div>
-  <div class="lf-arrow" id="arr3">→</div>
-  <div class="lf-node" id="lf-router">
-    <div class="lf-icon">🔀</div>
-    <div class="lf-label">Router</div>
-  </div>
-  <div class="lf-arrow" id="arr4">→</div>
-  <div class="lf-node" id="lf-api">
-    <div class="lf-icon">🤖</div>
-    <div class="lf-label">Claude API</div>
-  </div>
-  <div class="lf-arrow" id="arr5" style="transform:scaleX(-1)">→</div>
-  <div class="lf-node" id="lf-resp">
-    <div class="lf-icon">📬</div>
-    <div class="lf-label">Response</div>
-  </div>
-  <span style="margin-left:auto;font-size:0.72em;color:#6b7280;white-space:nowrap">
-    <span class="live-dot"></span>Live
-  </span>
-</div>
 
 <div class="grid">
   <div class="card" id="card-saved">
@@ -300,7 +262,14 @@ class DashboardServer {
   <button onclick="routeAllWindows()" title="Restarts the VS Code extension host so all existing Claude Code chat windows route through the proxy">Route all windows ↺</button>
 </div>
 
-<div class="status" id="proxy-status-bar"><span id="proxy-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#8b949e;margin-right:5px"></span><span id="proxy-status-text">Connecting to proxy…</span> · <a href="#how-it-works" style="color:#2563eb;text-decoration:none">How it works ↓</a></div>
+<div class="status" id="proxy-status-bar"><span id="proxy-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#8b949e;margin-right:5px"></span><span id="proxy-status-text">Connecting to proxy…</span></div>
+
+<div class="privacy" style="margin-top:16px">
+  🔒 Privacy: only token counts, costs, and model names are tracked. No prompt content. Nothing leaves <code>localhost</code>.
+</div>
+<div class="estimate-note">
+  ⚠️ <strong>Cost savings are estimates</strong> based on Anthropic's public pricing and the token delta between your original request and what was actually sent. Verify against your <a href="https://console.anthropic.com/settings/billing" style="color:#2563eb" target="_blank">Anthropic console</a>.
+</div>
 
 <script>
 function fmt(n) { return n >= 1000 ? (n/1000).toFixed(1)+'k' : String(Math.round(n||0)); }
@@ -313,35 +282,6 @@ function ago(ts) {
 }
 function ms(n) { return n >= 1000 ? (n/1000).toFixed(1)+'s' : n+'ms'; }
 
-// ── live flow animation ──────────────────────────────────────────────────────
-const FLOW_NODES = ['lf-vscode','lf-pii','lf-cache','lf-opt','lf-router','lf-api','lf-resp'];
-const FLOW_ARRS  = ['arr0','arr1','arr2','arr3','arr4','arr5'];
-let flowTimer = null;
-
-function animateFlow(isCacheHit, isDowngrade) {
-  if (flowTimer) clearTimeout(flowTimer);
-  const stopAt = isCacheHit ? 2 : FLOW_NODES.length - 1;
-  FLOW_NODES.forEach(id => document.getElementById(id)?.classList.remove('active'));
-  FLOW_ARRS.forEach(id => document.getElementById(id)?.classList.remove('active'));
-
-  let step = 0;
-  function next() {
-    if (step < FLOW_NODES.length && step <= stopAt) {
-      document.getElementById(FLOW_NODES[step])?.classList.add('active');
-      if (step > 0) document.getElementById(FLOW_ARRS[step-1])?.classList.add('active');
-      step++;
-      flowTimer = setTimeout(next, 220);
-    } else {
-      // Fade out after a moment
-      flowTimer = setTimeout(() => {
-        FLOW_NODES.forEach(id => document.getElementById(id)?.classList.remove('active'));
-        FLOW_ARRS.forEach(id => document.getElementById(id)?.classList.remove('active'));
-      }, 1200);
-    }
-  }
-  next();
-}
-
 // ── SSE for real-time pulse ──────────────────────────────────────────────────
 let prevReqs = 0;
 function connectSSE() {
@@ -350,7 +290,6 @@ function connectSSE() {
     try {
       const d = JSON.parse(e.data);
       if (d.type === 'request') {
-        animateFlow(d.cacheHit, d.modelDowngraded);
         ['card-saved','card-cost','card-cache','card-routes'].forEach(id => {
           const el = document.getElementById(id);
           el?.classList.remove('pulse');
@@ -477,9 +416,9 @@ function renderTraces(traces) {
   knownIds = new Set(rows.map((r,i) => r.id || i));
 }
 
-// Always read stats/traces from the proxy port (:8787) — whoever owns the proxy
-// owns the authoritative stats, even across multi-window ownership transfers.
-const PROXY_ORIGIN = 'http://localhost:8787';
+// Action calls (clear/restart) that must reach the proxy are relayed via the
+// dashboard server itself — so all fetches are same-origin (no CORS).
+const PROXY_ORIGIN = '';
 
 function setProxyStatus(online) {
   const dot = document.getElementById('proxy-dot');
@@ -487,15 +426,15 @@ function setProxyStatus(online) {
   if (!dot || !txt) return;
   dot.style.background = online ? '#3fb950' : '#f85149';
   txt.textContent = online
-    ? 'Proxy connected · localhost:8787 · auto-refreshing'
-    : 'Proxy offline — restart VS Code to reconnect (localhost:8787 not responding)';
+    ? 'Proxy connected · auto-refreshing'
+    : 'No data yet — open a new Claude Code chat window to start seeing requests';
 }
 
 async function poll() {
   try {
     const [sr, tr] = await Promise.all([
-      fetch(PROXY_ORIGIN + '/proxy-stats'),
-      fetch(PROXY_ORIGIN + '/proxy-traces'),
+      fetch('/stats'),
+      fetch('/traces'),
     ]);
     if (!sr.ok) throw new Error('stats ' + sr.status);
     renderStats(await sr.json());
@@ -507,7 +446,7 @@ async function poll() {
 }
 
 async function downloadLogs() {
-  const r = await fetch(PROXY_ORIGIN + '/proxy-traces');
+  const r = await fetch('/traces');
   const traces = await r.json();
   const cols = ['id','timestamp','originalModel','finalModel','routingReason','inputTokens','outputTokens',
     'cacheReadTokens','cacheCreationTokens','savedByCompression','savedCostUSD','durationMs','streaming','techniques','messagePreview'];

@@ -2,7 +2,7 @@
   "name": "claude-steward",
   "displayName": "Claude Steward — Cut Claude API Costs 60–90%",
   "description": "100% local, zero data stored. Reduces Claude Code API costs through semantic caching, prompt compression, smart model routing (Haiku for simple tasks), and context compaction. PII masked before anything leaves your machine. Live savings dashboard included.",
-  "version": "1.3.22",
+  "version": "1.3.23",
   "publisher": "PrashantMalan",
   "repository": {
     "type": "git",

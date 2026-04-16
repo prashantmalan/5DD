@@ -158,17 +158,6 @@ export class DashboardServer {
   .card .value.bump { transform: scale(1.12); }
   .card .hint  { font-size: 0.72em; color: #6b7280; margin-top: 2px; }
 
-  /* Mini live flow strip */
-  .liveflow { display: flex; align-items: center; gap: 0; margin-bottom: 24px; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 16px; overflow-x: auto; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-  .lf-node { display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 70px; }
-  .lf-icon { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.1em; border: 2px solid #e5e7eb; transition: border-color 0.3s, box-shadow 0.3s; background: #f9fafb; }
-  .lf-label { font-size: 0.62em; color: #6b7280; text-align: center; white-space: nowrap; }
-  .lf-arrow { color: #d1d5db; font-size: 1em; margin: 0 2px; margin-bottom: 18px; transition: color 0.3s; }
-  .lf-node.active .lf-icon { border-color: #16a34a; box-shadow: 0 0 10px rgba(22,163,74,0.4); }
-  .lf-arrow.active { color: #16a34a; }
-  .lf-node.active .lf-label { color: #16a34a; }
-  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #16a34a; animation: blink 1.5s infinite; margin-right: 6px; display: inline-block; }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
   table { width: 100%; border-collapse: collapse; font-size: 0.82em; }
   th { text-align: left; padding: 8px 10px; background: #f9fafb; color: #6b7280; font-weight: 500; border-bottom: 1px solid #e5e7eb; cursor: help; }
@@ -202,51 +191,6 @@ export class DashboardServer {
 <h1>Claude Steward</h1>
 <div class="sub">5DD Plan — live token savings dashboard</div>
 
-<nav>
-  <a href="/" class="active">Dashboard</a>
-  <a href="/flow">How it works ↗</a>
-</nav>
-
-<!-- Mini live flow strip -->
-<div class="liveflow" id="liveflow">
-  <div class="lf-node" id="lf-vscode">
-    <div class="lf-icon">💻</div>
-    <div class="lf-label">VS Code</div>
-  </div>
-  <div class="lf-arrow" id="arr0">→</div>
-  <div class="lf-node" id="lf-pii">
-    <div class="lf-icon">🔒</div>
-    <div class="lf-label">PII Filter</div>
-  </div>
-  <div class="lf-arrow" id="arr1">→</div>
-  <div class="lf-node" id="lf-cache">
-    <div class="lf-icon">⚡</div>
-    <div class="lf-label">Cache</div>
-  </div>
-  <div class="lf-arrow" id="arr2">→</div>
-  <div class="lf-node" id="lf-opt">
-    <div class="lf-icon">✂️</div>
-    <div class="lf-label">Optimizer</div>
-  </div>
-  <div class="lf-arrow" id="arr3">→</div>
-  <div class="lf-node" id="lf-router">
-    <div class="lf-icon">🔀</div>
-    <div class="lf-label">Router</div>
-  </div>
-  <div class="lf-arrow" id="arr4">→</div>
-  <div class="lf-node" id="lf-api">
-    <div class="lf-icon">🤖</div>
-    <div class="lf-label">Claude API</div>
-  </div>
-  <div class="lf-arrow" id="arr5" style="transform:scaleX(-1)">→</div>
-  <div class="lf-node" id="lf-resp">
-    <div class="lf-icon">📬</div>
-    <div class="lf-label">Response</div>
-  </div>
-  <span style="margin-left:auto;font-size:0.72em;color:#6b7280;white-space:nowrap">
-    <span class="live-dot"></span>Live
-  </span>
-</div>
 
 <div class="grid">
   <div class="card" id="card-saved">
@@ -270,13 +214,6 @@ export class DashboardServer {
     <div class="value" id="downgrades">—</div>
     <div class="hint">Routed to cheaper model</div>
   </div>
-</div>
-
-<div class="privacy">
-  🔒 Privacy: only token counts, costs, and model names are tracked. No prompt content. Nothing leaves <code>localhost</code>.
-</div>
-<div class="estimate-note">
-  ⚠️ <strong>Cost savings are estimates</strong> based on Anthropic's public pricing and the token delta between your original request and what was actually sent. Verify against your <a href="https://console.anthropic.com/settings/billing" style="color:#2563eb" target="_blank">Anthropic console</a>.
 </div>
 
 <!-- Cost reasoning box -->
@@ -306,7 +243,14 @@ export class DashboardServer {
   <button onclick="routeAllWindows()" title="Restarts the VS Code extension host so all existing Claude Code chat windows route through the proxy">Route all windows ↺</button>
 </div>
 
-<div class="status" id="proxy-status-bar"><span id="proxy-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#8b949e;margin-right:5px"></span><span id="proxy-status-text">Connecting to proxy…</span> · <a href="#how-it-works" style="color:#2563eb;text-decoration:none">How it works ↓</a></div>
+<div class="status" id="proxy-status-bar"><span id="proxy-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#8b949e;margin-right:5px"></span><span id="proxy-status-text">Connecting to proxy…</span></div>
+
+<div class="privacy" style="margin-top:16px">
+  🔒 Privacy: only token counts, costs, and model names are tracked. No prompt content. Nothing leaves <code>localhost</code>.
+</div>
+<div class="estimate-note">
+  ⚠️ <strong>Cost savings are estimates</strong> based on Anthropic's public pricing and the token delta between your original request and what was actually sent. Verify against your <a href="https://console.anthropic.com/settings/billing" style="color:#2563eb" target="_blank">Anthropic console</a>.
+</div>
 
 <script>
 function fmt(n) { return n >= 1000 ? (n/1000).toFixed(1)+'k' : String(Math.round(n||0)); }
@@ -319,35 +263,6 @@ function ago(ts) {
 }
 function ms(n) { return n >= 1000 ? (n/1000).toFixed(1)+'s' : n+'ms'; }
 
-// ── live flow animation ──────────────────────────────────────────────────────
-const FLOW_NODES = ['lf-vscode','lf-pii','lf-cache','lf-opt','lf-router','lf-api','lf-resp'];
-const FLOW_ARRS  = ['arr0','arr1','arr2','arr3','arr4','arr5'];
-let flowTimer = null;
-
-function animateFlow(isCacheHit, isDowngrade) {
-  if (flowTimer) clearTimeout(flowTimer);
-  const stopAt = isCacheHit ? 2 : FLOW_NODES.length - 1;
-  FLOW_NODES.forEach(id => document.getElementById(id)?.classList.remove('active'));
-  FLOW_ARRS.forEach(id => document.getElementById(id)?.classList.remove('active'));
-
-  let step = 0;
-  function next() {
-    if (step < FLOW_NODES.length && step <= stopAt) {
-      document.getElementById(FLOW_NODES[step])?.classList.add('active');
-      if (step > 0) document.getElementById(FLOW_ARRS[step-1])?.classList.add('active');
-      step++;
-      flowTimer = setTimeout(next, 220);
-    } else {
-      // Fade out after a moment
-      flowTimer = setTimeout(() => {
-        FLOW_NODES.forEach(id => document.getElementById(id)?.classList.remove('active'));
-        FLOW_ARRS.forEach(id => document.getElementById(id)?.classList.remove('active'));
-      }, 1200);
-    }
-  }
-  next();
-}
-
 // ── SSE for real-time pulse ──────────────────────────────────────────────────
 let prevReqs = 0;
 function connectSSE() {
@@ -356,7 +271,6 @@ function connectSSE() {
     try {
       const d = JSON.parse(e.data);
       if (d.type === 'request') {
-        animateFlow(d.cacheHit, d.modelDowngraded);
         ['card-saved','card-cost','card-cache','card-routes'].forEach(id => {
           const el = document.getElementById(id);
           el?.classList.remove('pulse');

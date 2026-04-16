@@ -214,7 +214,9 @@ export class ProxyServer {
       return;
     }
 
+    const tRead = Date.now();
     const rawBody = await readBody(req);
+    this.log(`  [perf] body-read: +${Date.now() - tRead}ms (${rawBody.length} bytes)`);
 
     // Internal calls (classify, summarize) — bypass all optimization to prevent loops
     if (req.headers['x-steward-internal']) {
@@ -245,12 +247,11 @@ export class ProxyServer {
     this.log(`[VIA PROXY] model=${body.model} stream=${body.stream}`);
 
     // ── OPTIMIZATION PIPELINE ────────────────────────────────────────────────
-    // Everything below is wrapped in try/catch. If any optimization step fails,
-    // we fall back to forwarding the sanitized (but otherwise unmodified) request.
     const isStreaming = body.stream === true;
+    const t0 = Date.now();
+    const tick = (label: string) => this.log(`  [perf] ${label}: +${Date.now() - t0}ms`);
 
     // ── GREETING SHORT-CIRCUIT ────────────────────────────────────────────────
-    // Only intercept bare single-message greetings (not internal title-gen calls which also have no system prompt but have history)
     const lastMsg = this.extractLastUserMessage(body);
     const isSingleMessage = body.messages.length === 1 && !body.system;
     if (this.isGreeting(lastMsg) && isSingleMessage) {
@@ -275,12 +276,13 @@ export class ProxyServer {
     let compressedTokens = originalTokens;
 
     try {
-      // Token count (re-use the already-computed value above)
       this.log(`[VIA PROXY] tokens=${originalTokens}`);
+      tick('token-count');
 
       // 1. Cache check — only for non-streaming requests
       if (this.config.enableCache && !isStreaming) {
         const cacheResult = this.cache.lookup(body, originalTokens);
+        tick('cache-lookup');
         if (cacheResult.hit && cacheResult.response) {
           this.log(`[VIA PROXY] CACHE HIT — not forwarded to Anthropic`);
           const cacheHitStat = this.buildStat({
@@ -306,6 +308,7 @@ export class ProxyServer {
         techniques.push('pii-redact');
         this.onPiiDetected?.(piiResult.types);
       }
+      tick('pii-filter');
 
       // 3. Prompt optimization + model routing run in parallel — classifier no longer
       //    adds serial latency on top of compression work.
@@ -317,6 +320,7 @@ export class ProxyServer {
       // Context compaction — summarize old turns when conversation is long
       const compaction = this.compactor.compact(optimizedBody, reqApiKey);
       if (compaction.compacted) { optimizedBody = compaction.body; }
+      tick('compaction');
 
       const [, routingResult] = await Promise.all([
         // Compression (sync but wrapped so it runs concurrently with routing await)
@@ -333,6 +337,8 @@ export class ProxyServer {
           ? this.router.route(optimizedBody, reqApiKey)
           : Promise.resolve(null),
       ]);
+
+      tick('compress+route');
 
       // 4. Apply routing decision
       if (this.config.enableModelRouter && routingResult) {
@@ -382,6 +388,7 @@ export class ProxyServer {
     }
 
     // Sanitize is now done at every forward point (forwardRaw, forwardToAnthropic, forwardStreaming)
+    tick('pipeline-total');
     this.log(`[VIA PROXY → ANTHROPIC] model=${optimizedBody.model}${modelDowngraded ? ` (routed from ${originalModel})` : ''}`);
 
     // ── FORWARD ──────────────────────────────────────────────────────────────
