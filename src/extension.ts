@@ -11,7 +11,7 @@
 
 import * as vscode from 'vscode';
 import * as net from 'net';
-import { exec } from 'child_process';
+import { exec, execSync } from 'child_process';
 import { TokenCounter } from './tokenCounter';
 import { PromptOptimizer } from './promptOptimizer';
 import { SemanticCache } from './semanticCache';
@@ -189,7 +189,10 @@ export async function activate(context: vscode.ExtensionContext) {
   function deactivateRouting() {
     delete process.env['ANTHROPIC_BASE_URL'];
     envColl.delete('ANTHROPIC_BASE_URL');
-    setUserEnvVar(null);
+    // Use execSync here so the registry delete completes before VS Code kills the process
+    if (process.platform === 'win32') {
+      try { execSync('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' }); } catch {}
+    }
     interceptor!.uninstall();
   }
 

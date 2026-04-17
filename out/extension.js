@@ -199,7 +199,13 @@ async function activate(context) {
     function deactivateRouting() {
         delete process.env['ANTHROPIC_BASE_URL'];
         envColl.delete('ANTHROPIC_BASE_URL');
-        setUserEnvVar(null);
+        // Use execSync here so the registry delete completes before VS Code kills the process
+        if (process.platform === 'win32') {
+            try {
+                (0, child_process_1.execSync)('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' });
+            }
+            catch { }
+        }
         interceptor.uninstall();
     }
     // Start health-check loop for the attached-window case (extracted to avoid duplication)
