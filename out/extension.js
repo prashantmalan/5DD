@@ -212,14 +212,10 @@ async function activate(context) {
     function isGloballyEnabled() {
         // Registry key present = some window activated routing. Absent = deliberately disabled.
         if (process.platform !== 'win32')
-            return true;
-        try {
-            (0, child_process_1.execSync)('reg query HKCU\\Environment /v ANTHROPIC_BASE_URL', { stdio: 'ignore' });
-            return true;
-        }
-        catch {
-            return false;
-        }
+            return Promise.resolve(true);
+        return new Promise(resolve => {
+            (0, child_process_1.exec)('reg query HKCU\\Environment /v ANTHROPIC_BASE_URL', { windowsHide: true }, (err) => resolve(!err));
+        });
     }
     // Start health-check loop for the attached-window case (extracted to avoid duplication)
     function startHealthCheck() {
@@ -227,7 +223,7 @@ async function activate(context) {
             if (await isProxyAlive(proxyConfig.port))
                 return;
             // Another window may have intentionally disabled the extension — don't restart.
-            if (!isGloballyEnabled()) {
+            if (!await isGloballyEnabled()) {
                 clearInterval(healthCheckInterval);
                 healthCheckInterval = null;
                 deactivateRouting();
@@ -266,8 +262,8 @@ async function activate(context) {
     // Global watcher — every window checks registry every 15s; if key is gone (another window
     // intentionally disabled), this window also deactivates. Enables true cross-window shutdown.
     function startGlobalWatch() {
-        globalWatchInterval = setInterval(() => {
-            if (!isGloballyEnabled()) {
+        globalWatchInterval = setInterval(async () => {
+            if (!await isGloballyEnabled()) {
                 exports.out.appendLine('[GLOBAL] ANTHROPIC_BASE_URL cleared globally — deactivating this window');
                 deactivateRouting();
                 proxy?.stop();

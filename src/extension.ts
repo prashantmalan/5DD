@@ -197,11 +197,12 @@ export async function activate(context: vscode.ExtensionContext) {
     interceptor!.uninstall();
   }
 
-  function isGloballyEnabled(): boolean {
+  function isGloballyEnabled(): Promise<boolean> {
     // Registry key present = some window activated routing. Absent = deliberately disabled.
-    if (process.platform !== 'win32') return true;
-    try { execSync('reg query HKCU\\Environment /v ANTHROPIC_BASE_URL', { stdio: 'ignore' }); return true; }
-    catch { return false; }
+    if (process.platform !== 'win32') return Promise.resolve(true);
+    return new Promise(resolve => {
+      exec('reg query HKCU\\Environment /v ANTHROPIC_BASE_URL', { windowsHide: true }, (err) => resolve(!err));
+    });
   }
 
   // Start health-check loop for the attached-window case (extracted to avoid duplication)
@@ -210,7 +211,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (await isProxyAlive(proxyConfig.port)) return;
 
       // Another window may have intentionally disabled the extension — don't restart.
-      if (!isGloballyEnabled()) {
+      if (!await isGloballyEnabled()) {
         clearInterval(healthCheckInterval!);
         healthCheckInterval = null;
         deactivateRouting();
@@ -250,8 +251,8 @@ export async function activate(context: vscode.ExtensionContext) {
   // Global watcher — every window checks registry every 15s; if key is gone (another window
   // intentionally disabled), this window also deactivates. Enables true cross-window shutdown.
   function startGlobalWatch() {
-    globalWatchInterval = setInterval(() => {
-      if (!isGloballyEnabled()) {
+    globalWatchInterval = setInterval(async () => {
+      if (!await isGloballyEnabled()) {
         out.appendLine('[GLOBAL] ANTHROPIC_BASE_URL cleared globally — deactivating this window');
         deactivateRouting();
         proxy?.stop();
