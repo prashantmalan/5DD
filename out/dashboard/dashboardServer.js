@@ -152,6 +152,14 @@ class DashboardServer {
         return this.server !== null && this.server.listening;
     }
     html() {
+        const stats = JSON.stringify(this.stats.getSessionStats());
+        const traces = JSON.stringify(this.getTraces());
+        return this._html()
+            .replace('__DASHBOARD_PORT__', String(this.port))
+            .replace('"__INITIAL_STATS__"', stats)
+            .replace('"__INITIAL_TRACES__"', traces);
+    }
+    _html() {
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -283,13 +291,17 @@ function ago(ts) {
 function ms(n) { return n >= 1000 ? (n/1000).toFixed(1)+'s' : n+'ms'; }
 
 // ── SSE for real-time pulse ──────────────────────────────────────────────────
+const PROXY_ORIGIN = 'http://localhost:__DASHBOARD_PORT__';
 let prevReqs = 0;
 function connectSSE() {
-  const es = new EventSource('/events');
+  const es = new EventSource(PROXY_ORIGIN + '/events');
+  es.onopen = () => poll(); // fetch existing data as soon as SSE connects
   es.onmessage = e => {
     try {
       const d = JSON.parse(e.data);
-      if (d.type === 'request') {
+      if (d.type === 'connected') {
+        poll(); // initial load
+      } else if (d.type === 'request') {
         ['card-saved','card-cost','card-cache','card-routes'].forEach(id => {
           const el = document.getElementById(id);
           el?.classList.remove('pulse');
@@ -304,6 +316,10 @@ function connectSSE() {
   es.onerror = () => setTimeout(connectSSE, 3000);
 }
 connectSSE();
+// Render server-side injected initial data immediately (no fetch needed)
+try { renderStats("__INITIAL_STATS__"); } catch(e) {}
+try { renderTraces("__INITIAL_TRACES__"); } catch(e) {}
+setProxyStatus(true);
 
 // ── stats render ─────────────────────────────────────────────────────────────
 function renderStats(s) {
@@ -418,7 +434,6 @@ function renderTraces(traces) {
 
 // Action calls (clear/restart) that must reach the proxy are relayed via the
 // dashboard server itself — so all fetches are same-origin (no CORS).
-const PROXY_ORIGIN = '';
 
 function setProxyStatus(online) {
   const dot = document.getElementById('proxy-dot');
@@ -433,8 +448,8 @@ function setProxyStatus(online) {
 async function poll() {
   try {
     const [sr, tr] = await Promise.all([
-      fetch('/stats'),
-      fetch('/traces'),
+      fetch(PROXY_ORIGIN + '/stats'),
+      fetch(PROXY_ORIGIN + '/traces'),
     ]);
     if (!sr.ok) throw new Error('stats ' + sr.status);
     renderStats(await sr.json());
@@ -446,7 +461,7 @@ async function poll() {
 }
 
 async function downloadLogs() {
-  const r = await fetch('/traces');
+  const r = await fetch(PROXY_ORIGIN + '/traces');
   const traces = await r.json();
   const cols = ['id','timestamp','originalModel','finalModel','routingReason','inputTokens','outputTokens',
     'cacheReadTokens','cacheCreationTokens','savedByCompression','savedCostUSD','durationMs','streaming','techniques','messagePreview'];
@@ -473,7 +488,7 @@ async function routeAllWindows() {
 }
 
 poll();
-setInterval(poll, 1500);
+setInterval(poll, 5000);
 </script>
 
 <!-- ── How it works ──────────────────────────────────────────────────────── -->
