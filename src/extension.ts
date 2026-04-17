@@ -107,7 +107,6 @@ export async function activate(context: vscode.ExtensionContext) {
   };
 
   // ── Startup cleanup — clear stale ANTHROPIC_BASE_URL from registry ──────────
-  // Handles crash-on-shutdown or port-change scenarios where old value lingers.
   if (process.platform === 'win32') {
     exec(
       `powershell -NoProfile -Command "[System.Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL','User')"`,
@@ -121,6 +120,11 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       }
     );
+
+    // Last-resort: sync cleanup when the extension host process exits (covers uninstall).
+    process.on('exit', () => {
+      try { execSync('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' }); } catch {}
+    });
   }
 
   proxy = new ProxyServer(proxyConfig, cache, optimizer, router, tokenCounter, stats,
