@@ -86,6 +86,10 @@ export class ProxyServer {
     this.traces = traces.slice(-MAX_TRACES);
   }
 
+  clearTraces(): void {
+    this.traces = [];
+  }
+
   setOnTrace(cb: (trace: MessageTrace) => void): void { this.onTrace = cb; }
   setOnPiiDetected(cb: (types: string[]) => void): void { this.onPiiDetected = cb; }
   setOnRestartHost(cb: () => void): void { this.onRestartHost = cb; }

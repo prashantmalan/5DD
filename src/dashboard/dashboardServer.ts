@@ -23,6 +23,7 @@ export class DashboardServer {
   private stats: StatsTracker;
   private getTraces: () => object[];
   private sseClients: http.ServerResponse[] = [];
+  private onClear: (() => void) | null = null;
 
   constructor(stats: StatsTracker, port = 8788, getTraces?: () => object[], proxyPort = 8787) {
     this.stats = stats;
@@ -30,6 +31,8 @@ export class DashboardServer {
     this.proxyPort = proxyPort;
     this.getTraces = getTraces ?? (() => []);
   }
+
+  setOnClear(cb: () => void) { this.onClear = cb; }
 
   /** Push a real-time event to all SSE listeners */
   pushEvent(type: string, payload?: object) {
@@ -78,6 +81,7 @@ export class DashboardServer {
 
         if (url === '/clear' && req.method === 'POST') {
           this.stats.clear();
+          this.onClear?.();
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
           return;

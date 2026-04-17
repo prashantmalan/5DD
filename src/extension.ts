@@ -168,6 +168,10 @@ export async function activate(context: vscode.ExtensionContext) {
   // ── Dashboard HTTP server ─────────────────────────────────────────────────
   const dashboardPort = config.get<number>('dashboardPort', 8788);
   const dashboardServer = new DashboardServer(stats, dashboardPort, () => proxy!.getTraces());
+  dashboardServer.setOnClear(() => {
+    proxy!.clearTraces();
+    context.workspaceState.update('claudeOptimizer.traces', []);
+  });
   proxy.setOnTrace(trace => {
     dashboardServer.pushEvent('request', {
       cacheHit: trace.cacheHit,
@@ -385,6 +389,8 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('claudeOptimizer.clearProxyState', () => {
       cache.clear();
       stats.clear();
+      proxy!.clearTraces();
+      context.workspaceState.update('claudeOptimizer.traces', []);
       vscode.window.showInformationMessage('Proxy state cleared (cache + stats reset).');
     }),
 
