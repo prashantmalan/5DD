@@ -12,8 +12,9 @@
 import * as https from 'https';
 import { AnthropicRequestBody } from './tokenCounter';
 
-const COMPACT_THRESHOLD = 20;  // start compacting after this many message turns
-const KEEP_RECENT       = 10;  // always preserve this many recent turns verbatim
+const COMPACT_THRESHOLD = 8;   // start compacting after this many message turns
+const KEEP_RECENT       = 4;   // always preserve this many recent turns verbatim
+const COMPACT_INTERVAL_MS = 10 * 60 * 1000; // force compaction every 10 minutes
 
 const SUMMARY_PROMPT = `You are a context compactor for an AI coding assistant session.
 Summarize the key information from the conversation turns below so the assistant can continue effectively.
@@ -65,8 +66,9 @@ function turnsToText(msgs: Message[]): string {
 }
 
 export class ContextCompactor {
-  private summaryCache = new Map<string, string>(); // cacheKey → summary text
-  private pendingKeys  = new Set<string>();          // in-flight summarizations
+  private summaryCache  = new Map<string, string>(); // cacheKey → summary text
+  private pendingKeys   = new Set<string>();          // in-flight summarizations
+  private sessionStart  = new Map<string, number>();  // sessionKey → start timestamp
 
   /**
    * Returns a (possibly compacted) request body.
@@ -74,7 +76,16 @@ export class ContextCompactor {
    */
   compact(body: AnthropicRequestBody, apiKey: string): { body: AnthropicRequestBody; compacted: boolean } {
     const messages = body.messages;
-    if (messages.length <= COMPACT_THRESHOLD) {
+
+    // Derive a session key from first message content (stable across requests in same session)
+    const sessionKey = messages.length > 0 ? quickHash(messages.slice(0, 1)) : '';
+    if (sessionKey && !this.sessionStart.has(sessionKey)) {
+      this.sessionStart.set(sessionKey, Date.now());
+    }
+    const sessionAge = sessionKey ? Date.now() - (this.sessionStart.get(sessionKey) ?? Date.now()) : 0;
+    const timeForced = sessionAge >= COMPACT_INTERVAL_MS;
+
+    if (messages.length <= COMPACT_THRESHOLD && !timeForced) {
       return { body, compacted: false };
     }
 
