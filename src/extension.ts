@@ -394,6 +394,20 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.window.showInformationMessage('Proxy state cleared (cache + stats reset).');
     }),
 
+    vscode.commands.registerCommand('claudeOptimizer.emergencyCleanup', async () => {
+      const pick = await vscode.window.showWarningMessage(
+        'This will remove ANTHROPIC_BASE_URL from the registry and stop the proxy. Run before uninstalling.',
+        'Run Cleanup', 'Cancel'
+      );
+      if (pick !== 'Run Cleanup') { return; }
+      deactivateRouting();
+      await proxy?.stop();
+      if (process.platform === 'win32') {
+        try { execSync('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' }); } catch {}
+      }
+      vscode.window.showInformationMessage('Cleanup done. You can now uninstall safely.');
+    }),
+
     vscode.commands.registerCommand('claudeOptimizer.optimizeSelection', async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor || editor.selection.isEmpty) {
