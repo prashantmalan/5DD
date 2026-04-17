@@ -39,6 +39,15 @@ export class DashboardServer {
     });
   }
 
+  /** Send SSE keep-alive pings so browsers detect dead connections */
+  private startHeartbeat() {
+    setInterval(() => {
+      this.sseClients = this.sseClients.filter(client => {
+        try { client.write(': ping\n\n'); return true; } catch { return false; }
+      });
+    }, 20_000);
+  }
+
   start(): Promise<string> {
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => {
@@ -102,6 +111,7 @@ export class DashboardServer {
 
       this.server.on('error', reject);
       this.server.listen(this.port, '127.0.0.1', () => {
+        this.startHeartbeat();
         resolve(`http://localhost:${this.port}`);
       });
     });
@@ -224,12 +234,6 @@ export class DashboardServer {
   </div>
 </div>
 
-<!-- Cost reasoning box -->
-<div id="cost-reasoning" style="display:none;background:#ffffff;border:1px solid #e5e7eb;border-left:3px solid #3fb950;border-radius:6px;padding:12px 16px;margin-bottom:20px;font-size:0.82em;line-height:1.6">
-  <strong style="font-size:0.9em;display:block;margin-bottom:8px;color:#111827">How your savings are calculated</strong>
-  <div id="reasoning-text" style="color:#6b7280"></div>
-</div>
-
 <h2 style="font-size:0.95em;font-weight:600;margin-bottom:10px;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em">Recent Requests</h2>
 <table>
   <thead><tr>
@@ -243,6 +247,12 @@ export class DashboardServer {
   </tr></thead>
   <tbody id="tbody"><tr><td colspan="7" style="color:#6b7280;padding:16px 10px">Waiting for requests…</td></tr></tbody>
 </table>
+
+<!-- Cost reasoning box -->
+<div id="cost-reasoning" style="display:none;background:#ffffff;border:1px solid #e5e7eb;border-left:3px solid #3fb950;border-radius:6px;padding:12px 16px;margin-top:20px;margin-bottom:20px;font-size:0.82em;line-height:1.6">
+  <strong style="font-size:0.9em;display:block;margin-bottom:8px;color:#111827">How your savings are calculated</strong>
+  <div id="reasoning-text" style="color:#6b7280"></div>
+</div>
 
 <div class="actions">
   <button class="dl" onclick="downloadLogs()">Download logs (CSV)</button>
@@ -297,6 +307,7 @@ function connectSSE() {
   es.onerror = () => setTimeout(connectSSE, 3000);
 }
 connectSSE();
+setInterval(poll, 15_000); // fallback: refresh even if SSE silently drops
 // Render server-side injected initial data immediately (no fetch needed)
 try { renderStats("__INITIAL_STATS__"); } catch(e) {}
 try { renderTraces("__INITIAL_TRACES__"); } catch(e) {}

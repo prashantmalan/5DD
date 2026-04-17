@@ -127,16 +127,55 @@ export async function activate(context: vscode.ExtensionContext) {
     (msg) => out.appendLine(`[${new Date().toISOString().slice(11,19)}] ${msg}`)
   );
 
+  // Restore persisted traces so the dashboard table survives restarts
+  const savedTraces = context.workspaceState.get<object[]>('claudeOptimizer.traces', []);
+  out.appendLine(`[TRACE-RESTORE] savedTraces=${savedTraces.length}, statsRecords=${stats.getRecentActivity(1000).length}`);
+  if (savedTraces.length > 0) {
+    proxy.loadTraces(savedTraces as any);
+    out.appendLine(`[TRACE-RESTORE] loaded ${savedTraces.length} from workspaceState`);
+  } else {
+    // Fall back to StatsTracker data (pre-dates trace persistence)
+    const recentStats = stats.getRecentActivity(200);
+    out.appendLine(`[TRACE-RESTORE] fallback: recentStats=${recentStats.length}`);
+    if (recentStats.length > 0) {
+      proxy.loadTraces(recentStats.map(s => ({
+        id: String(s.timestamp),
+        timestamp: s.timestamp,
+        originalModel: s.originalModel,
+        finalModel: s.model,
+        routingReason: '',
+        inputTokens: s.inputTokens,
+        outputTokens: s.outputTokens,
+        cacheReadTokens: s.cacheReadTokens,
+        cacheCreationTokens: s.cacheCreationTokens,
+        savedByCompression: s.savedTokensByCompression,
+        originalTokens: s.inputTokens + s.cacheReadTokens + s.cacheCreationTokens + s.savedTokensByCompression,
+        savedCostUSD: s.savedCostUSD,
+        savedCostByCompression: s.savedCostByCompression ?? 0,
+        savedCostByRouting: s.savedCostByRouting ?? 0,
+        techniques: s.techniques,
+        streaming: false,
+        durationMs: 0,
+        messagePreview: '',
+        cacheHit: s.cacheHit,
+      })));
+      out.appendLine(`[TRACE-RESTORE] loaded ${recentStats.length} from StatsTracker; getTraces()=${proxy.getTraces().length}`);
+    }
+  }
+
   setStatusBarLoading();
 
   // ── Dashboard HTTP server ─────────────────────────────────────────────────
   const dashboardPort = config.get<number>('dashboardPort', 8788);
   const dashboardServer = new DashboardServer(stats, dashboardPort, () => proxy!.getTraces());
-  proxy.setOnTrace(trace => dashboardServer.pushEvent('request', {
-    cacheHit: trace.cacheHit,
-    modelDowngraded: trace.originalModel !== trace.finalModel,
-    savedCostUSD: trace.savedCostUSD,
-  }));
+  proxy.setOnTrace(trace => {
+    dashboardServer.pushEvent('request', {
+      cacheHit: trace.cacheHit,
+      modelDowngraded: trace.originalModel !== trace.finalModel,
+      savedCostUSD: trace.savedCostUSD,
+    });
+    context.workspaceState.update('claudeOptimizer.traces', proxy!.getTraces(200));
+  });
   proxy.setOnRestartHost(() => {
     vscode.commands.executeCommand('workbench.action.restartExtensionHost');
   });
@@ -228,6 +267,10 @@ export async function activate(context: vscode.ExtensionContext) {
         await proxy!.start();
         activateRouting();
         updateStatusBar(stats.getSessionStats().totalSavedTokens, true);
+        // Also take over the dashboard if it wasn't started (secondary window scenario)
+        if (!dashboardServer.isRunning()) {
+          try { dashboardUrl = await dashboardServer.start(); } catch {}
+        }
         out.appendLine('[PROXY] Took ownership — now the primary proxy');
         vscode.window.showInformationMessage('Claude Steward: Proxy restarted — this window is now the owner.');
       } catch {
@@ -399,8 +442,10 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate(): Promise<void> {
-  // healthCheckInterval and ANTHROPIC_BASE_URL are cleared by the subscription dispose above.
-  // Only async work goes here — VS Code awaits the returned promise.
+  // Subscriptions may not be disposed if VS Code kills the host on uninstall — clean up explicitly.
+  if (process.platform === 'win32') {
+    try { execSync('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' }); } catch {}
+  }
   await proxy?.stop();
 }
 

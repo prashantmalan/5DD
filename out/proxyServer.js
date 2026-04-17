@@ -58,6 +58,9 @@ class ProxyServer {
     getTraces(n = 50) {
         return this.traces.slice(-n).reverse();
     }
+    loadTraces(traces) {
+        this.traces = traces.slice(-MAX_TRACES);
+    }
     setOnTrace(cb) { this.onTrace = cb; }
     setOnPiiDetected(cb) { this.onPiiDetected = cb; }
     setOnRestartHost(cb) { this.onRestartHost = cb; }
