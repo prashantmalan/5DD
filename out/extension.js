@@ -208,11 +208,31 @@ async function activate(context) {
         }
         interceptor.uninstall();
     }
+    function isGloballyEnabled() {
+        // Registry key present = some window activated routing. Absent = deliberately disabled.
+        if (process.platform !== 'win32')
+            return true;
+        try {
+            (0, child_process_1.execSync)('reg query HKCU\\Environment /v ANTHROPIC_BASE_URL', { stdio: 'ignore' });
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }
     // Start health-check loop for the attached-window case (extracted to avoid duplication)
     function startHealthCheck() {
         healthCheckInterval = setInterval(async () => {
             if (await isProxyAlive(proxyConfig.port))
                 return;
+            // Another window may have intentionally disabled the extension — don't restart.
+            if (!isGloballyEnabled()) {
+                clearInterval(healthCheckInterval);
+                healthCheckInterval = null;
+                deactivateRouting();
+                exports.out.appendLine('[PROXY] Registry key cleared — proxy disabled globally, not restarting');
+                return;
+            }
             clearInterval(healthCheckInterval);
             healthCheckInterval = null;
             isAttachedToExistingProxy = false;

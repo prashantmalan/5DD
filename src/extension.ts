@@ -196,10 +196,26 @@ export async function activate(context: vscode.ExtensionContext) {
     interceptor!.uninstall();
   }
 
+  function isGloballyEnabled(): boolean {
+    // Registry key present = some window activated routing. Absent = deliberately disabled.
+    if (process.platform !== 'win32') return true;
+    try { execSync('reg query HKCU\\Environment /v ANTHROPIC_BASE_URL', { stdio: 'ignore' }); return true; }
+    catch { return false; }
+  }
+
   // Start health-check loop for the attached-window case (extracted to avoid duplication)
   function startHealthCheck() {
     healthCheckInterval = setInterval(async () => {
       if (await isProxyAlive(proxyConfig.port)) return;
+
+      // Another window may have intentionally disabled the extension — don't restart.
+      if (!isGloballyEnabled()) {
+        clearInterval(healthCheckInterval!);
+        healthCheckInterval = null;
+        deactivateRouting();
+        out.appendLine('[PROXY] Registry key cleared — proxy disabled globally, not restarting');
+        return;
+      }
 
       clearInterval(healthCheckInterval!);
       healthCheckInterval = null;
