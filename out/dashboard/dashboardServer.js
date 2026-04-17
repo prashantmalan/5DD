@@ -333,7 +333,7 @@ function renderStats(s) {
     if (byCmp > 0 && avgOrig > 0) {
       html += '<div style="margin-bottom:6px">✂️ <strong>Compression:</strong> Your prompts averaged <strong>' + fmt(avgOrig) + ' tokens</strong> before optimization. '
         + 'We trimmed them to ~<strong>' + fmt(avgSent) + ' tokens</strong> before sending — removing <strong>' + fmt(avgRemoved) + ' tokens</strong> per request. '
-        + 'Those removed tokens × Anthropic\'s input price = <strong>' + fmtCost(byCmp) + ' saved</strong> across ' + apiReqs + ' request' + (apiReqs !== 1 ? 's' : '') + '.</div>';
+        + 'Those removed tokens × Anthropic\\'s input price = <strong>' + fmtCost(byCmp) + ' saved</strong> across ' + apiReqs + ' request' + (apiReqs !== 1 ? 's' : '') + '.</div>';
     }
     if (byRte > 0) {
       html += '<div style="margin-bottom:6px">🔀 <strong>Model routing:</strong> ' + (s.modelDowngrades||0) + ' request' + ((s.modelDowngrades||0) !== 1 ? 's were' : ' was')
