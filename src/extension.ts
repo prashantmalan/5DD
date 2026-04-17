@@ -38,6 +38,7 @@ let proxy: ProxyServer | null = null;
 let tokenCounter: TokenCounter;
 let stats: StatsTracker;
 let healthCheckInterval: NodeJS.Timeout | null = null;
+let globalWatchInterval: NodeJS.Timeout | null = null;
 let isAttachedToExistingProxy = false;
 let interceptor: NetworkInterceptor | null = null;
 
@@ -246,10 +247,26 @@ export async function activate(context: vscode.ExtensionContext) {
     }, 10_000);
   }
 
+  // Global watcher — every window checks registry every 15s; if key is gone (another window
+  // intentionally disabled), this window also deactivates. Enables true cross-window shutdown.
+  function startGlobalWatch() {
+    globalWatchInterval = setInterval(() => {
+      if (!isGloballyEnabled()) {
+        out.appendLine('[GLOBAL] ANTHROPIC_BASE_URL cleared globally — deactivating this window');
+        deactivateRouting();
+        proxy?.stop();
+        updateStatusBar(0, false);
+        if (globalWatchInterval) { clearInterval(globalWatchInterval); globalWatchInterval = null; }
+        if (healthCheckInterval)  { clearInterval(healthCheckInterval);  healthCheckInterval = null; }
+      }
+    }, 15_000);
+  }
+
   // Auto-start proxy. If port is already taken, another VS Code window owns it — attach to it.
   try {
     await proxy.start();
     activateRouting();
+    startGlobalWatch();
     out.appendLine(`[PROXY UP] Listening on ${proxyUrl} — all Claude Code traffic routes through us`);
     out.appendLine(`[DASHBOARD] ${dashboardUrl}`);
     updateStatusBar(0, true);
@@ -258,6 +275,7 @@ export async function activate(context: vscode.ExtensionContext) {
     if ((err as any).message?.includes('already in use')) {
       isAttachedToExistingProxy = true;
       activateRouting();
+      startGlobalWatch();
       out.appendLine(`[PROXY] Port ${proxyConfig.port} already in use — attaching to existing proxy`);
       updateStatusBar(0, true);
       vscode.window.showInformationMessage(`Claude Steward: Attached to existing proxy on :${proxyConfig.port}`);
@@ -367,7 +385,8 @@ export async function activate(context: vscode.ExtensionContext) {
   // Async proxy stop is handled in deactivate() which VS Code does await.
   context.subscriptions.push({
     dispose: () => {
-      if (healthCheckInterval) { clearInterval(healthCheckInterval); healthCheckInterval = null; }
+      if (healthCheckInterval)  { clearInterval(healthCheckInterval);  healthCheckInterval = null; }
+      if (globalWatchInterval)  { clearInterval(globalWatchInterval);  globalWatchInterval = null; }
       deactivateRouting();          // envColl.delete clears env from all terminals immediately
       logMonitor.dispose();
       tokenCounter.dispose();

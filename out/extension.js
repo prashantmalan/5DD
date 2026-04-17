@@ -73,6 +73,7 @@ let proxy = null;
 let tokenCounter;
 let stats;
 let healthCheckInterval = null;
+let globalWatchInterval = null;
 let isAttachedToExistingProxy = false;
 let interceptor = null;
 async function activate(context) {
@@ -262,10 +263,31 @@ async function activate(context) {
             }
         }, 10000);
     }
+    // Global watcher — every window checks registry every 15s; if key is gone (another window
+    // intentionally disabled), this window also deactivates. Enables true cross-window shutdown.
+    function startGlobalWatch() {
+        globalWatchInterval = setInterval(() => {
+            if (!isGloballyEnabled()) {
+                exports.out.appendLine('[GLOBAL] ANTHROPIC_BASE_URL cleared globally — deactivating this window');
+                deactivateRouting();
+                proxy?.stop();
+                updateStatusBar(0, false);
+                if (globalWatchInterval) {
+                    clearInterval(globalWatchInterval);
+                    globalWatchInterval = null;
+                }
+                if (healthCheckInterval) {
+                    clearInterval(healthCheckInterval);
+                    healthCheckInterval = null;
+                }
+            }
+        }, 15000);
+    }
     // Auto-start proxy. If port is already taken, another VS Code window owns it — attach to it.
     try {
         await proxy.start();
         activateRouting();
+        startGlobalWatch();
         exports.out.appendLine(`[PROXY UP] Listening on ${proxyUrl} — all Claude Code traffic routes through us`);
         exports.out.appendLine(`[DASHBOARD] ${dashboardUrl}`);
         updateStatusBar(0, true);
@@ -275,6 +297,7 @@ async function activate(context) {
         if (err.message?.includes('already in use')) {
             isAttachedToExistingProxy = true;
             activateRouting();
+            startGlobalWatch();
             exports.out.appendLine(`[PROXY] Port ${proxyConfig.port} already in use — attaching to existing proxy`);
             updateStatusBar(0, true);
             vscode.window.showInformationMessage(`Claude Steward: Attached to existing proxy on :${proxyConfig.port}`);
@@ -365,6 +388,10 @@ async function activate(context) {
             if (healthCheckInterval) {
                 clearInterval(healthCheckInterval);
                 healthCheckInterval = null;
+            }
+            if (globalWatchInterval) {
+                clearInterval(globalWatchInterval);
+                globalWatchInterval = null;
             }
             deactivateRouting(); // envColl.delete clears env from all terminals immediately
             logMonitor.dispose();
