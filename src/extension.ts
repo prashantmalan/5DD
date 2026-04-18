@@ -12,6 +12,12 @@
 import * as vscode from 'vscode';
 import * as net from 'net';
 import { exec, execSync } from 'child_process';
+
+// Broadcasts WM_SETTINGCHANGE so running apps (VS Code, terminals) pick up the
+// env change immediately — no restart required.
+const WIN_CLEAR_BASE_URL = `powershell -NoProfile -Command "[System.Environment]::SetEnvironmentVariable('ANTHROPIC_BASE_URL',$null,'User')"`;
+const WIN_SET_BASE_URL = (v: string) => `powershell -NoProfile -Command "[System.Environment]::SetEnvironmentVariable('ANTHROPIC_BASE_URL','${v}','User')"`;
+
 import { TokenCounter } from './tokenCounter';
 import { PromptOptimizer } from './promptOptimizer';
 import { SemanticCache } from './semanticCache';
@@ -114,7 +120,7 @@ export async function activate(context: vscode.ExtensionContext) {
         const existing = stdout.trim();
         const expected = `http://localhost:${proxyConfig.port}`;
         if (existing && existing !== expected) {
-          exec(`reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f`, () => {
+          exec(WIN_CLEAR_BASE_URL, () => {
             out.appendLine(`[CLEANUP] Cleared stale ANTHROPIC_BASE_URL (was: ${existing})`);
           });
         }
@@ -123,7 +129,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Last-resort: sync cleanup when the extension host process exits (covers uninstall).
     process.on('exit', () => {
-      try { execSync('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' }); } catch {}
+      try { execSync(WIN_CLEAR_BASE_URL, { stdio: 'ignore' }); } catch {}
     });
   }
 
@@ -219,8 +225,8 @@ export async function activate(context: vscode.ExtensionContext) {
     // setx writes to HKCU; no admin required. New processes pick it up immediately.
     if (process.platform === 'win32') {
       const cmd = value
-        ? `setx ANTHROPIC_BASE_URL "${value}"`
-        : `reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f`;
+        ? WIN_SET_BASE_URL(value)
+        : WIN_CLEAR_BASE_URL;
       exec(cmd, (err) => {
         if (err) out.appendLine(`[ENV] setx failed: ${err.message}`);
         else out.appendLine(`[ENV] ANTHROPIC_BASE_URL ${value ? `set to ${value}` : 'cleared'} (user env)`);
@@ -239,7 +245,7 @@ export async function activate(context: vscode.ExtensionContext) {
     envColl.delete('ANTHROPIC_BASE_URL');
     // Use execSync here so the registry delete completes before VS Code kills the process
     if (process.platform === 'win32') {
-      try { execSync('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' }); } catch {}
+      try { execSync(WIN_CLEAR_BASE_URL, { stdio: 'ignore' }); } catch {}
     }
     interceptor!.uninstall();
   }
@@ -407,7 +413,7 @@ export async function activate(context: vscode.ExtensionContext) {
       deactivateRouting();
       await proxy?.stop();
       if (process.platform === 'win32') {
-        try { execSync('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' }); } catch {}
+        try { execSync(WIN_CLEAR_BASE_URL, { stdio: 'ignore' }); } catch {}
       }
       vscode.window.showInformationMessage('Cleanup done. You can now uninstall safely.');
     }),
@@ -468,7 +474,7 @@ export async function activate(context: vscode.ExtensionContext) {
 export async function deactivate(): Promise<void> {
   // Subscriptions may not be disposed if VS Code kills the host on uninstall — clean up explicitly.
   if (process.platform === 'win32') {
-    try { execSync('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' }); } catch {}
+    try { execSync(WIN_CLEAR_BASE_URL, { stdio: 'ignore' }); } catch {}
   }
   await proxy?.stop();
 }
