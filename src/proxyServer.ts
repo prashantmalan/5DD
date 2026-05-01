@@ -22,6 +22,7 @@ import { TokenCounter, AnthropicRequestBody } from './tokenCounter';
 import { IStatsTracker, RequestStat } from './statsTracker';
 import { PiiFilter } from './piiFilter';
 import { ContextCompactor } from './contextCompactor';
+import { modelTier, tierRank, sanitizeThinkingFields as sanitize, stripHaikuUnsupported } from './requestSanitizer';
 
 const ANTHROPIC_HOST = 'api.anthropic.com';
 const MAX_TRACES = 200;
@@ -394,44 +395,11 @@ export class ProxyServer {
         modelDowngraded = selectedTier !== originalTier && tierRank(selectedTier) < tierRank(originalTier);
         routingReason = routing.reason;
 
-        // When routing to a model that doesn't support thinking, strip everything related
         if (optimizedBody.model.includes('haiku')) {
-          delete optimizedBody.thinking;
-          delete optimizedBody.strategy;
-          delete optimizedBody.betas;
-          delete optimizedBody.effort;
-          delete optimizedBody.context_management;
-          delete optimizedBody.output_config;
-          delete optimizedBody.priority;           // Haiku doesn't support priority
-          // Cap max_tokens to Haiku's limit (8192)
-          if (optimizedBody.max_tokens && optimizedBody.max_tokens > 8192) {
-            optimizedBody.max_tokens = 8192;
-          }
-          // Strip thinking blocks from message history
-          if (optimizedBody.messages) {
-            optimizedBody.messages = optimizedBody.messages.map(msg => {
-              if (!Array.isArray(msg.content)) return msg;
-              const filtered = msg.content.filter((b: any) =>
-                b?.type !== 'thinking' && b?.type !== 'redacted_thinking'
-              );
-              return filtered.length === msg.content.length ? msg : { ...msg, content: filtered };
-            });
-          }
-          // Scrub thinking betas from headers
-          if (req.headers['anthropic-beta']) {
-            const cleaned = (Array.isArray(req.headers['anthropic-beta'])
-              ? req.headers['anthropic-beta']
-              : [req.headers['anthropic-beta'] as string])
-              .flatMap(b => b.split(',').map(s => s.trim()))
-              .filter(b => !b.toLowerCase().includes('thinking'));
-            if (cleaned.length > 0) {
-              req.headers['anthropic-beta'] = cleaned.join(',');
-            } else {
-              delete req.headers['anthropic-beta'];
-            }
-          }
+          stripHaikuUnsupported(optimizedBody, req);
+        } else {
+          sanitize(optimizedBody, req);
         }
-        // For non-Haiku models: DON'T touch thinking — the original request had it configured correctly
       }
     } catch (e) {
       // Optimization failed — fall back to sanitized original body
@@ -700,38 +668,8 @@ export class ProxyServer {
     };
   }
 
-  /**
-   * Ensure thinking/strategy consistency in a parsed body.
-   * strategy requires thinking.type to be "enabled" or "adaptive".
-   * Also strips thinking-related beta headers when thinking is not active.
-   */
   private sanitizeThinkingFields(body: any, req?: http.IncomingMessage): any {
-    const hasValidThinking = body.thinking &&
-      (body.thinking.type === 'enabled' || body.thinking.type === 'adaptive');
-    if (!hasValidThinking) {
-      delete body.strategy;
-      delete body.thinking;
-      delete body.context_management;
-      delete body.output_config;
-      // effort is only valid alongside thinking; strip it when thinking is off
-      delete body.effort;
-      if (req && req.headers['anthropic-beta']) {
-        const cleaned = (Array.isArray(req.headers['anthropic-beta'])
-          ? req.headers['anthropic-beta']
-          : [req.headers['anthropic-beta'] as string])
-          .flatMap((b: string) => b.split(',').map(s => s.trim()))
-          .filter((b: string) => !b.toLowerCase().includes('thinking'));
-        if (cleaned.length > 0) {
-          req.headers['anthropic-beta'] = cleaned.join(',');
-        } else {
-          delete req.headers['anthropic-beta'];
-        }
-      }
-    } else if (body.effort === 'x_high' && body.model && !body.model.includes('opus')) {
-      // x_high effort is only supported on Opus; downgrade to high for other models
-      body.effort = 'high';
-    }
-    return body;
+    return sanitize(body, req);
   }
 
   // Build headers for forwarding — pass ALL original headers, fix host + content-length
@@ -898,17 +836,6 @@ export class ProxyServer {
       techniques: params.techniques,
     };
   }
-}
-
-function modelTier(model: string): 'haiku' | 'sonnet' | 'opus' | 'unknown' {
-  if (model.includes('haiku')) return 'haiku';
-  if (model.includes('sonnet')) return 'sonnet';
-  if (model.includes('opus')) return 'opus';
-  return 'unknown';
-}
-
-function tierRank(tier: ReturnType<typeof modelTier>): number {
-  return tier === 'haiku' ? 0 : tier === 'sonnet' ? 1 : tier === 'opus' ? 2 : 1;
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
