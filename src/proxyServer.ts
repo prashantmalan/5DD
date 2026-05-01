@@ -259,19 +259,7 @@ export class ProxyServer {
     const t0 = Date.now();
     const tick = (label: string) => this.log(`  [perf] ${label}: +${Date.now() - t0}ms`);
 
-    // ── GREETING SHORT-CIRCUIT ────────────────────────────────────────────────
     const lastMsg = this.extractLastUserMessage(body);
-    const isSingleMessage = body.messages.length === 1 && !body.system;
-    if (this.isGreeting(lastMsg) && isSingleMessage) {
-      this.log(`[VIA PROXY] Greeting intercepted — not forwarded to Anthropic`);
-      if (isStreaming) {
-        this.greetingResponseSSE(body, res);
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(this.greetingResponse(body)));
-      }
-      return;
-    }
     let techniques: string[] = [];
     let modelDowngraded = false;
     let routingReason = 'passthrough';
