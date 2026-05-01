@@ -256,6 +256,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // ── Attach or spawn worker ────────────────────────────────────────────────
   const wasAlive = await isProxyAlive(proxyPort);
+  // True when this activation is the post-restart pass (flag set in previous activation).
+  const justRestarted = context.workspaceState.get<boolean>('claudeOptimizer.justRestarted', false);
+  await context.workspaceState.update('claudeOptimizer.justRestarted', false);
+
   if (wasAlive) {
     out.appendLine('[PROXY] Worker already running — attached');
     activateRouting(proxyUrl, envColl);
@@ -276,6 +280,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       activateRouting(proxyUrl, envColl);
       updateStatusBar(0, true);
       out.appendLine(`[PROXY UP] :${proxyPort} | dashboard: ${dashboardUrl}`);
+
+      // If this is the first activation after install (not a post-restart pass),
+      // restart the extension host so Claude Code (same host) inherits ANTHROPIC_BASE_URL.
+      if (!justRestarted) {
+        out.appendLine('[PROXY] Restarting extension host so Claude Code picks up env var...');
+        await context.workspaceState.update('claudeOptimizer.justRestarted', true);
+        // Small delay so the registry write finishes before the host exits.
+        setTimeout(() => vscode.commands.executeCommand('workbench.action.restartExtensionHost'), 800);
+        return;
+      }
+
       vscode.window.showInformationMessage(
         `Claude Steward active — proxy :${proxyPort}, dashboard ${dashboardUrl}`);
     } else {
