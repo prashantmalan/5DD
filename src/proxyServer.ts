@@ -363,6 +363,11 @@ export class ProxyServer {
           delete optimizedBody.effort;
           delete optimizedBody.context_management;
           delete optimizedBody.output_config;
+          delete optimizedBody.priority;           // Haiku doesn't support priority
+          // Cap max_tokens to Haiku's limit (8192)
+          if (optimizedBody.max_tokens && optimizedBody.max_tokens > 8192) {
+            optimizedBody.max_tokens = 8192;
+          }
           // Strip thinking blocks from message history
           if (optimizedBody.messages) {
             optimizedBody.messages = optimizedBody.messages.map(msg => {

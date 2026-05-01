@@ -127,7 +127,12 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     );
 
-    // Last-resort: sync cleanup when the extension host process exits (covers uninstall).
+    // SIGTERM fires before SIGKILL on uninstall — gives us time to clean up synchronously.
+    process.on('SIGTERM', () => {
+      try { execSync(WIN_CLEAR_BASE_URL, { stdio: 'ignore' }); } catch {}
+      process.exit(0);
+    });
+    // exit handler as belt-and-suspenders for clean shutdown paths.
     process.on('exit', () => {
       try { execSync(WIN_CLEAR_BASE_URL, { stdio: 'ignore' }); } catch {}
     });
