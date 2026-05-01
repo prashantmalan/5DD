@@ -713,6 +713,8 @@ export class ProxyServer {
       delete body.thinking;
       delete body.context_management;
       delete body.output_config;
+      // effort is only valid alongside thinking; strip it when thinking is off
+      delete body.effort;
       if (req && req.headers['anthropic-beta']) {
         const cleaned = (Array.isArray(req.headers['anthropic-beta'])
           ? req.headers['anthropic-beta']
@@ -725,6 +727,9 @@ export class ProxyServer {
           delete req.headers['anthropic-beta'];
         }
       }
+    } else if (body.effort === 'x_high' && body.model && !body.model.includes('opus')) {
+      // x_high effort is only supported on Opus; downgrade to high for other models
+      body.effort = 'high';
     }
     return body;
   }
