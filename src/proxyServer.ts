@@ -383,8 +383,15 @@ export class ProxyServer {
       // 4. Apply routing decision
       if (this.config.enableModelRouter && routingResult) {
         const routing = routingResult;
-        optimizedBody.model = routing.selectedModel;
-        modelDowngraded = routing.downgraded;
+        // Preserve the original model version when staying in the same tier.
+        // The router picks a tier (haiku/sonnet/opus); if the tier matches the
+        // original request, use the exact model the client sent — never swap
+        // e.g. claude-sonnet-4-5 → claude-sonnet-4-6 (different version, may be inaccessible).
+        const selectedTier  = modelTier(routing.selectedModel);
+        const originalTier  = modelTier(originalModel);
+        const effectiveModel = selectedTier === originalTier ? originalModel : routing.selectedModel;
+        optimizedBody.model = effectiveModel;
+        modelDowngraded = selectedTier !== originalTier && tierRank(selectedTier) < tierRank(originalTier);
         routingReason = routing.reason;
 
         // When routing to a model that doesn't support thinking, strip everything related
@@ -886,6 +893,17 @@ export class ProxyServer {
       techniques: params.techniques,
     };
   }
+}
+
+function modelTier(model: string): 'haiku' | 'sonnet' | 'opus' | 'unknown' {
+  if (model.includes('haiku')) return 'haiku';
+  if (model.includes('sonnet')) return 'sonnet';
+  if (model.includes('opus')) return 'opus';
+  return 'unknown';
+}
+
+function tierRank(tier: ReturnType<typeof modelTier>): number {
+  return tier === 'haiku' ? 0 : tier === 'sonnet' ? 1 : tier === 'opus' ? 2 : 1;
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
