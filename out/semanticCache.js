@@ -88,24 +88,18 @@ class SemanticCache {
         };
         this.cache.set(key, entry);
         this.entries.push(entry);
-        // Keep entries list bounded — evict lowest-hit entries
+        // Keep entries bounded. Incremental IDF updates are unsound after eviction
+        // (N changes but stored TF vectors are stale), so reset the whole corpus instead.
         if (this.entries.length > 500) {
-            const evicted = this.entries
-                .sort((a, b) => a.hits - b.hits)
-                .slice(0, 100);
-            // Undo their DF contributions
-            for (const e of evicted) {
-                for (const term of new Set(tokenize(e.promptText))) {
-                    const df = (this.termDf.get(term) ?? 1) - 1;
-                    if (df <= 0)
-                        this.termDf.delete(term);
-                    else
-                        this.termDf.set(term, df);
-                }
-            }
             this.entries = this.entries
                 .sort((a, b) => b.hits - a.hits)
                 .slice(0, 400);
+            this.termDf.clear();
+            for (const e of this.entries) {
+                for (const term of new Set(tokenize(e.promptText))) {
+                    this.termDf.set(term, (this.termDf.get(term) ?? 0) + 1);
+                }
+            }
         }
     }
     clear() {

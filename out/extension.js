@@ -1,13 +1,10 @@
 "use strict";
 /**
- * Claude Token Optimizer — VS Code Extension Entry Point
+ * Claude Steward — VS Code Extension Entry Point
  *
- * Wires together:
- *  - Local proxy server (intercepts Anthropic API calls)
- *  - Token counter + prompt optimizer + semantic cache + model router
- *  - Log monitor + Git monitor
- *  - Context builder with integrations (Jira, CI/CD, Azure, etc.)
- *  - Dashboard webview + status bar
+ * Spawns a detached proxy worker process (proxyWorker.js) that outlives
+ * extension host restarts. The extension host manages env vars, status bar,
+ * and workspaceState persistence; all proxy/dashboard logic lives in the worker.
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -48,18 +45,16 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const net = __importStar(require("net"));
+const http = __importStar(require("http"));
+const path = __importStar(require("path"));
 const child_process_1 = require("child_process");
-const tokenCounter_1 = require("./tokenCounter");
-const promptOptimizer_1 = require("./promptOptimizer");
-const semanticCache_1 = require("./semanticCache");
-const modelRouter_1 = require("./modelRouter");
-const statsTracker_1 = require("./statsTracker");
-const proxyServer_1 = require("./proxyServer");
+const child_process_2 = require("child_process");
 const networkInterceptor_1 = require("./networkInterceptor");
+const promptOptimizer_1 = require("./promptOptimizer");
+const tokenCounter_1 = require("./tokenCounter");
 const logMonitor_1 = require("./logMonitor");
 const gitMonitor_1 = require("./gitMonitor");
 const contextBuilder_1 = require("./contextBuilder");
-const dashboardServer_1 = require("./dashboard/dashboardServer");
 // Integrations
 const jiraIntegration_1 = require("./integrations/jiraIntegration");
 const confluenceIntegration_1 = require("./integrations/confluenceIntegration");
@@ -68,40 +63,169 @@ const azureIntegration_1 = require("./integrations/azureIntegration");
 const databricksIntegration_1 = require("./integrations/databricksIntegration");
 const terraformIntegration_1 = require("./integrations/terraformIntegration");
 const databaseIntegration_1 = require("./integrations/databaseIntegration");
+// Broadcasts WM_SETTINGCHANGE so running apps pick up the env change immediately.
+const WIN_CLEAR_BASE_URL = `powershell -NoProfile -Command "[System.Environment]::SetEnvironmentVariable('ANTHROPIC_BASE_URL',$null,'User')"`;
+const WIN_SET_BASE_URL = (v) => `powershell -NoProfile -Command "[System.Environment]::SetEnvironmentVariable('ANTHROPIC_BASE_URL','${v}','User')"`;
 let statusBarItem;
-let proxy = null;
-let tokenCounter;
-let stats;
+let statsPollingInterval = null;
 let healthCheckInterval = null;
-let globalWatchInterval = null;
-let isAttachedToExistingProxy = false;
 let interceptor = null;
+let proxyEnabled = true;
+let proxyPort = 8787;
+let dashboardPort = 8788;
+let dashboardUrl = '';
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+function proxyHttp(method, urlPath, body) {
+    return new Promise((resolve) => {
+        const data = body ? JSON.stringify(body) : '';
+        const headers = {};
+        if (data) {
+            headers['Content-Type'] = 'application/json';
+            headers['Content-Length'] = Buffer.byteLength(data);
+        }
+        const req = http.request({ host: '127.0.0.1', port: proxyPort, path: urlPath, method, headers }, (res) => {
+            let buf = '';
+            res.on('data', (c) => buf += c);
+            res.on('end', () => { try {
+                resolve(JSON.parse(buf));
+            }
+            catch {
+                resolve({});
+            } });
+        });
+        req.on('error', () => resolve({}));
+        if (data) {
+            req.write(data);
+        }
+        req.end();
+    });
+}
+function isProxyAlive(port) {
+    return new Promise((resolve) => {
+        const socket = new net.Socket();
+        const timer = setTimeout(() => { socket.destroy(); resolve(false); }, 2000);
+        socket.connect(port, '127.0.0.1', () => { clearTimeout(timer); socket.destroy(); resolve(true); });
+        socket.on('error', () => { clearTimeout(timer); resolve(false); });
+    });
+}
+function waitForProxy(port, maxMs = 8000) {
+    return new Promise((resolve) => {
+        const deadline = Date.now() + maxMs;
+        const poll = () => {
+            isProxyAlive(port).then(alive => {
+                if (alive) {
+                    resolve(true);
+                    return;
+                }
+                if (Date.now() > deadline) {
+                    resolve(false);
+                    return;
+                }
+                setTimeout(poll, 300);
+            });
+        };
+        poll();
+    });
+}
+// ── Worker spawning ───────────────────────────────────────────────────────────
+function spawnWorker(cfg) {
+    const configArg = Buffer.from(JSON.stringify(cfg)).toString('base64');
+    const workerPath = path.join(__dirname, 'proxyWorker.js');
+    const worker = (0, child_process_1.fork)(workerPath, [configArg], {
+        detached: true,
+        silent: true, // capture stdout/stderr via events, don't inherit
+    });
+    worker.stdout?.on('data', (d) => exports.out.appendLine(d.toString().trimEnd()));
+    worker.stderr?.on('data', (d) => exports.out.appendLine(d.toString().trimEnd()));
+    worker.once('message', (msg) => {
+        if (msg?.type === 'ready') {
+            exports.out.appendLine(`[WORKER] Ready on :${msg.port} PID=${worker.pid}`);
+            worker.disconnect(); // close IPC — worker is now truly independent
+            worker.unref(); // don't keep extension host alive for this child
+        }
+    });
+    worker.on('exit', () => {
+        try {
+            worker.disconnect();
+        }
+        catch { }
+    });
+    worker.on('error', (err) => exports.out.appendLine(`[WORKER] Spawn error: ${err.message}`));
+}
+// ── Env-var routing ───────────────────────────────────────────────────────────
+function activateRouting(proxyUrl, envColl) {
+    process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
+    envColl.replace('ANTHROPIC_BASE_URL', proxyUrl);
+    if (process.platform === 'win32') {
+        (0, child_process_2.exec)(WIN_SET_BASE_URL(proxyUrl), () => { });
+    }
+    interceptor?.install();
+}
+function deactivateRouting(envColl) {
+    delete process.env['ANTHROPIC_BASE_URL'];
+    envColl.delete('ANTHROPIC_BASE_URL');
+    if (process.platform === 'win32') {
+        try {
+            (0, child_process_2.execSync)(WIN_CLEAR_BASE_URL, { stdio: 'ignore' });
+        }
+        catch { }
+    }
+    interceptor?.uninstall();
+}
+function isGloballyEnabled() {
+    if (process.platform !== 'win32') {
+        return Promise.resolve(true);
+    }
+    return new Promise(resolve => (0, child_process_2.exec)('reg query HKCU\\Environment /v ANTHROPIC_BASE_URL', { windowsHide: true }, (err) => resolve(!err)));
+}
+// ── Status bar ────────────────────────────────────────────────────────────────
+function updateStatusBar(savedTokens, running, enabled = true) {
+    const icon = !running ? '$(circle-slash)' : enabled ? '$(shield)' : '$(debug-pause)';
+    const saved = savedTokens >= 1000 ? `${(savedTokens / 1000).toFixed(1)}k` : String(savedTokens);
+    const state = !running ? 'OFF' : enabled ? `${saved} tokens saved` : 'PAUSED';
+    statusBarItem.text = `${icon} Claude Optimizer: ${state}`;
+    statusBarItem.backgroundColor = enabled && running
+        ? undefined
+        : new vscode.ThemeColor('statusBarItem.warningBackground');
+}
+// ── Worker config builder ─────────────────────────────────────────────────────
+function buildWorkerCfg(cfg) {
+    return {
+        proxy: {
+            port: proxyPort,
+            enabled: true,
+            enableCache: cfg.get('enableCache', true),
+            enableCompression: cfg.get('enablePromptCompression', true),
+            enableModelRouter: cfg.get('enableModelRouter', true),
+            enablePiiRedaction: cfg.get('enablePiiRedaction', true),
+            apiKey: cfg.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
+        },
+        dashboardPort,
+        cacheThreshold: cfg.get('cacheThreshold', 0.92),
+        routerConfig: {
+            enabled: cfg.get('enableModelRouter', true),
+            apiKey: cfg.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
+            minimumModel: cfg.get('minimumModel'),
+            allowOpus: cfg.get('allowOpus', false),
+            mode: cfg.get('modelRouterMode', 'balanced'),
+        },
+    };
+}
+// ── Main activation ───────────────────────────────────────────────────────────
 async function activate(context) {
     exports.out = vscode.window.createOutputChannel('Claude Steward');
     context.subscriptions.push(exports.out);
     exports.out.appendLine('[Claude Steward] Activating...');
-    const config = vscode.workspace.getConfiguration('claudeOptimizer');
+    const cfg = vscode.workspace.getConfiguration('claudeOptimizer');
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
-    // ── Core modules ──────────────────────────────────────────────────────────
-    tokenCounter = new tokenCounter_1.TokenCounter();
-    await tokenCounter.init();
-    const cache = new semanticCache_1.SemanticCache(config.get('cacheThreshold', 0.92));
-    const optimizer = new promptOptimizer_1.PromptOptimizer(tokenCounter);
-    const routerConfig = {
-        enabled: config.get('enableModelRouter', true),
-        apiKey: config.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
-        minimumModel: config.get('minimumModel'),
-        allowOpus: config.get('allowOpus', false),
-        mode: config.get('modelRouterMode', 'balanced'),
-    };
-    const router = new modelRouter_1.ModelRouter(routerConfig);
-    stats = new statsTracker_1.StatsTracker(context);
-    // ── Context system ────────────────────────────────────────────────────────
+    proxyPort = cfg.get('proxyPort', 8787);
+    dashboardPort = cfg.get('dashboardPort', 8788);
+    dashboardUrl = `http://localhost:${dashboardPort}`;
+    // ── Context modules (kept in extension host for log/git monitoring) ───────
     const logMonitor = new logMonitor_1.LogMonitor();
     const gitMonitor = new gitMonitor_1.GitMonitor(workspaceRoot);
     const contextBuilder = new contextBuilder_1.ContextBuilder(logMonitor, gitMonitor);
-    registerIntegrations(contextBuilder, config, workspaceRoot);
-    // Auto-watch logs in workspace
+    registerIntegrations(contextBuilder, cfg, workspaceRoot);
     const logsDir = vscode.Uri.joinPath(vscode.workspace.workspaceFolders?.[0]?.uri || vscode.Uri.file(workspaceRoot), 'logs');
     logMonitor.watchDirectory(logsDir.fsPath, '*.log');
     // ── Status bar ────────────────────────────────────────────────────────────
@@ -111,372 +235,221 @@ async function activate(context) {
     updateStatusBar(0, false, true);
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
-    // Update status bar on every stat update
-    stats.onUpdate(s => {
-        updateStatusBar(s.totalSavedTokens, proxy?.isRunning() || isAttachedToExistingProxy);
-    });
-    // ── Proxy server ──────────────────────────────────────────────────────────
-    const proxyConfig = {
-        port: config.get('proxyPort', 8787),
-        enabled: true,
-        enableCache: config.get('enableCache', true),
-        enableCompression: config.get('enablePromptCompression', true),
-        enableModelRouter: config.get('enableModelRouter', true),
-        enablePiiRedaction: config.get('enablePiiRedaction', true),
-        apiKey: config.get('anthropicApiKey', '') || process.env.ANTHROPIC_API_KEY || '',
-    };
-    // ── Startup cleanup — clear stale ANTHROPIC_BASE_URL from registry ──────────
-    // Handles crash-on-shutdown or port-change scenarios where old value lingers.
+    // ── Network interceptor ───────────────────────────────────────────────────
+    interceptor = new networkInterceptor_1.NetworkInterceptor(proxyPort);
+    // ── Windows SIGTERM/exit cleanup ──────────────────────────────────────────
     if (process.platform === 'win32') {
-        (0, child_process_1.exec)(`powershell -NoProfile -Command "[System.Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL','User')"`, (_err, stdout) => {
-            const existing = stdout.trim();
-            const expected = `http://localhost:${proxyConfig.port}`;
-            if (existing && existing !== expected) {
-                (0, child_process_1.exec)(`reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f`, () => {
-                    exports.out.appendLine(`[CLEANUP] Cleared stale ANTHROPIC_BASE_URL (was: ${existing})`);
-                });
-            }
-        });
-    }
-    proxy = new proxyServer_1.ProxyServer(proxyConfig, cache, optimizer, router, tokenCounter, stats, (msg) => exports.out.appendLine(`[${new Date().toISOString().slice(11, 19)}] ${msg}`));
-    // Restore persisted traces so the dashboard table survives restarts
-    const savedTraces = context.workspaceState.get('claudeOptimizer.traces', []);
-    exports.out.appendLine(`[TRACE-RESTORE] savedTraces=${savedTraces.length}, statsRecords=${stats.getRecentActivity(1000).length}`);
-    if (savedTraces.length > 0) {
-        proxy.loadTraces(savedTraces);
-        exports.out.appendLine(`[TRACE-RESTORE] loaded ${savedTraces.length} from workspaceState`);
-    }
-    else {
-        // Fall back to StatsTracker data (pre-dates trace persistence)
-        const recentStats = stats.getRecentActivity(200);
-        exports.out.appendLine(`[TRACE-RESTORE] fallback: recentStats=${recentStats.length}`);
-        if (recentStats.length > 0) {
-            proxy.loadTraces(recentStats.map(s => ({
-                id: String(s.timestamp),
-                timestamp: s.timestamp,
-                originalModel: s.originalModel,
-                finalModel: s.model,
-                routingReason: '',
-                inputTokens: s.inputTokens,
-                outputTokens: s.outputTokens,
-                cacheReadTokens: s.cacheReadTokens,
-                cacheCreationTokens: s.cacheCreationTokens,
-                savedByCompression: s.savedTokensByCompression,
-                originalTokens: s.inputTokens + s.cacheReadTokens + s.cacheCreationTokens + s.savedTokensByCompression,
-                savedCostUSD: s.savedCostUSD,
-                savedCostByCompression: s.savedCostByCompression ?? 0,
-                savedCostByRouting: s.savedCostByRouting ?? 0,
-                techniques: s.techniques,
-                streaming: false,
-                durationMs: 0,
-                messagePreview: '',
-                cacheHit: s.cacheHit,
-            })));
-            exports.out.appendLine(`[TRACE-RESTORE] loaded ${recentStats.length} from StatsTracker; getTraces()=${proxy.getTraces().length}`);
-        }
-    }
-    setStatusBarLoading();
-    // ── Dashboard HTTP server ─────────────────────────────────────────────────
-    const dashboardPort = config.get('dashboardPort', 8788);
-    const dashboardServer = new dashboardServer_1.DashboardServer(stats, dashboardPort, () => proxy.getTraces());
-    proxy.setOnTrace(trace => {
-        dashboardServer.pushEvent('request', {
-            cacheHit: trace.cacheHit,
-            modelDowngraded: trace.originalModel !== trace.finalModel,
-            savedCostUSD: trace.savedCostUSD,
-        });
-        context.workspaceState.update('claudeOptimizer.traces', proxy.getTraces(200));
-    });
-    proxy.setOnRestartHost(() => {
-        vscode.commands.executeCommand('workbench.action.restartExtensionHost');
-    });
-    let lastPiiWarnAt = 0;
-    proxy.setOnPiiDetected(types => {
-        const now = Date.now();
-        if (now - lastPiiWarnAt < 30000) {
-            return;
-        } // throttle: once per 30 s
-        lastPiiWarnAt = now;
-        vscode.window.showWarningMessage(`Claude Steward detected and masked PII in your prompt (${types.join(', ')}). ` +
-            'It was replaced with readable placeholders before being sent to Claude — your real data was not transmitted.');
-    });
-    let dashboardUrl = `http://localhost:${dashboardPort}`;
-    try {
-        dashboardUrl = await dashboardServer.start();
-        console.log(`[Claude Optimizer] Dashboard at ${dashboardUrl}`);
-    }
-    catch {
-        console.warn('[Claude Optimizer] Dashboard server failed to start');
-    }
-    context.subscriptions.push({ dispose: () => dashboardServer.stop() });
-    // ── Env-var helpers — use environmentVariableCollection so ALL terminals (existing + new)
-    //    get ANTHROPIC_BASE_URL immediately, and VS Code clears it automatically on disable/uninstall.
-    const proxyUrl = `http://localhost:${proxyConfig.port}`;
-    const envColl = context.environmentVariableCollection;
-    envColl.description = new vscode.MarkdownString('Set by **Claude Steward** to route Claude Code traffic through the local optimising proxy.');
-    interceptor = new networkInterceptor_1.NetworkInterceptor(proxyConfig.port);
-    function setUserEnvVar(value) {
-        // Use setx to persist at Windows user level — same as set_env.bat but automatic.
-        // setx writes to HKCU; no admin required. New processes pick it up immediately.
-        if (process.platform === 'win32') {
-            const cmd = value
-                ? `setx ANTHROPIC_BASE_URL "${value}"`
-                : `reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f`;
-            (0, child_process_1.exec)(cmd, (err) => {
-                if (err)
-                    exports.out.appendLine(`[ENV] setx failed: ${err.message}`);
-                else
-                    exports.out.appendLine(`[ENV] ANTHROPIC_BASE_URL ${value ? `set to ${value}` : 'cleared'} (user env)`);
-            });
-        }
-    }
-    function activateRouting() {
-        process.env['ANTHROPIC_BASE_URL'] = proxyUrl;
-        envColl.replace('ANTHROPIC_BASE_URL', proxyUrl);
-        setUserEnvVar(proxyUrl);
-        interceptor.install();
-    }
-    function deactivateRouting() {
-        delete process.env['ANTHROPIC_BASE_URL'];
-        envColl.delete('ANTHROPIC_BASE_URL');
-        // Use execSync here so the registry delete completes before VS Code kills the process
-        if (process.platform === 'win32') {
+        process.on('SIGTERM', () => {
             try {
-                (0, child_process_1.execSync)('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' });
+                (0, child_process_2.execSync)(WIN_CLEAR_BASE_URL, { stdio: 'ignore' });
             }
             catch { }
-        }
-        interceptor.uninstall();
-    }
-    function isGloballyEnabled() {
-        // Registry key present = some window activated routing. Absent = deliberately disabled.
-        if (process.platform !== 'win32')
-            return Promise.resolve(true);
-        return new Promise(resolve => {
-            (0, child_process_1.exec)('reg query HKCU\\Environment /v ANTHROPIC_BASE_URL', { windowsHide: true }, (err) => resolve(!err));
+            process.exit(0);
+        });
+        process.on('exit', () => {
+            try {
+                (0, child_process_2.execSync)(WIN_CLEAR_BASE_URL, { stdio: 'ignore' });
+            }
+            catch { }
         });
     }
-    // Start health-check loop for the attached-window case (extracted to avoid duplication)
+    // ── Build worker config ───────────────────────────────────────────────────
+    const workerCfg = buildWorkerCfg(cfg);
+    // ── Startup cleanup — clear stale registry value ──────────────────────────
+    if (process.platform === 'win32') {
+        (0, child_process_2.exec)(`powershell -NoProfile -Command "[System.Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL','User')"`, (_err, stdout) => {
+            const existing = stdout.trim();
+            const expected = `http://localhost:${proxyPort}`;
+            if (existing && existing !== expected) {
+                (0, child_process_2.exec)(WIN_CLEAR_BASE_URL, () => exports.out.appendLine(`[CLEANUP] Cleared stale ANTHROPIC_BASE_URL (was: ${existing})`));
+            }
+        });
+    }
+    // ── Env-var collection ────────────────────────────────────────────────────
+    const proxyUrl = `http://localhost:${proxyPort}`;
+    const envColl = context.environmentVariableCollection;
+    envColl.description = new vscode.MarkdownString('Set by **Claude Steward** to route Claude Code traffic through the local optimising proxy.');
+    // ── Attach or spawn worker ────────────────────────────────────────────────
+    const wasAlive = await isProxyAlive(proxyPort);
+    if (wasAlive) {
+        exports.out.appendLine('[PROXY] Worker already running — attached');
+        activateRouting(proxyUrl, envColl);
+        updateStatusBar(0, true);
+    }
+    else {
+        exports.out.appendLine('[PROXY] Spawning proxy worker...');
+        statusBarItem.text = '$(loading~spin) Claude Optimizer: Starting...';
+        spawnWorker(workerCfg);
+        const started = await waitForProxy(proxyPort, 10000);
+        if (started) {
+            // Load persisted traces into the fresh worker
+            const savedTraces = context.workspaceState.get('claudeOptimizer.traces', []);
+            if (savedTraces.length > 0) {
+                await proxyHttp('POST', '/proxy-load-traces', savedTraces);
+                exports.out.appendLine(`[TRACE-RESTORE] loaded ${savedTraces.length} traces into worker`);
+            }
+            activateRouting(proxyUrl, envColl);
+            updateStatusBar(0, true);
+            exports.out.appendLine(`[PROXY UP] :${proxyPort} | dashboard: ${dashboardUrl}`);
+            vscode.window.showInformationMessage(`Claude Steward active — proxy :${proxyPort}, dashboard ${dashboardUrl}`);
+        }
+        else {
+            exports.out.appendLine('[PROXY ERROR] Worker did not start in time');
+            updateStatusBar(0, false);
+            vscode.window.showWarningMessage('Claude Steward: proxy worker failed to start.');
+        }
+    }
+    // ── Poll proxy stats for status bar + workspaceState persistence ──────────
+    function startStatsPolling() {
+        statsPollingInterval = setInterval(async () => {
+            try {
+                const s = await proxyHttp('GET', '/proxy-stats');
+                if (s?.totalRequests !== undefined) {
+                    updateStatusBar(s.totalSavedTokens ?? 0, true, proxyEnabled);
+                }
+                const traces = await proxyHttp('GET', '/proxy-traces');
+                if (Array.isArray(traces) && traces.length > 0) {
+                    context.workspaceState.update('claudeOptimizer.traces', traces);
+                }
+            }
+            catch { }
+        }, 5000);
+    }
+    startStatsPolling();
+    // ── Health check — respawn worker if it dies unexpectedly ─────────────────
     function startHealthCheck() {
         healthCheckInterval = setInterval(async () => {
-            if (await isProxyAlive(proxyConfig.port))
+            if (await isProxyAlive(proxyPort)) {
                 return;
-            // Another window may have intentionally disabled the extension — don't restart.
+            }
             if (!await isGloballyEnabled()) {
+                exports.out.appendLine('[HEALTH] Proxy gone + registry cleared — staying disabled');
                 clearInterval(healthCheckInterval);
                 healthCheckInterval = null;
-                deactivateRouting();
-                exports.out.appendLine('[PROXY] Registry key cleared — proxy disabled globally, not restarting');
                 return;
             }
-            clearInterval(healthCheckInterval);
-            healthCheckInterval = null;
-            isAttachedToExistingProxy = false;
-            exports.out.appendLine('[PROXY] Attached proxy died — attempting to take ownership');
-            try {
-                await proxy.start();
-                activateRouting();
-                updateStatusBar(stats.getSessionStats().totalSavedTokens, true);
-                // Also take over the dashboard if it wasn't started (secondary window scenario)
-                if (!dashboardServer.isRunning()) {
-                    try {
-                        dashboardUrl = await dashboardServer.start();
-                    }
-                    catch { }
-                }
-                exports.out.appendLine('[PROXY] Took ownership — now the primary proxy');
-                vscode.window.showInformationMessage('Claude Steward: Proxy restarted — this window is now the owner.');
+            exports.out.appendLine('[HEALTH] Proxy died — respawning worker...');
+            spawnWorker(buildWorkerCfg(vscode.workspace.getConfiguration('claudeOptimizer')));
+            const ok = await waitForProxy(proxyPort, 10000);
+            if (ok) {
+                exports.out.appendLine('[HEALTH] Worker respawned');
+                vscode.window.showInformationMessage('Claude Steward: proxy restarted automatically.');
             }
-            catch {
-                // Race: another window may have beaten us — give it a moment then check
-                await new Promise(r => setTimeout(r, 500));
-                if (await isProxyAlive(proxyConfig.port)) {
-                    isAttachedToExistingProxy = true;
-                    activateRouting();
-                    exports.out.appendLine('[PROXY] Another window restarted the proxy — re-attached');
-                    startHealthCheck();
-                }
-                else {
-                    deactivateRouting();
-                    updateStatusBar(0, false);
-                    exports.out.appendLine('[PROXY] Could not restart proxy — routing deactivated');
-                    vscode.window.showWarningMessage('Claude Steward: Proxy stopped and could not restart.');
-                }
-            }
-        }, 10000);
-    }
-    // Global watcher — every window checks registry every 15s; if key is gone (another window
-    // intentionally disabled), this window also deactivates. Enables true cross-window shutdown.
-    function startGlobalWatch() {
-        globalWatchInterval = setInterval(async () => {
-            if (!await isGloballyEnabled()) {
-                exports.out.appendLine('[GLOBAL] ANTHROPIC_BASE_URL cleared globally — deactivating this window');
-                deactivateRouting();
-                proxy?.stop();
-                updateStatusBar(0, false);
-                if (globalWatchInterval) {
-                    clearInterval(globalWatchInterval);
-                    globalWatchInterval = null;
-                }
-                if (healthCheckInterval) {
-                    clearInterval(healthCheckInterval);
-                    healthCheckInterval = null;
-                }
+            else {
+                exports.out.appendLine('[HEALTH] Respawn failed');
             }
         }, 15000);
     }
-    // Auto-start proxy. If port is already taken, another VS Code window owns it — attach to it.
-    try {
-        await proxy.start();
-        activateRouting();
-        startGlobalWatch();
-        exports.out.appendLine(`[PROXY UP] Listening on ${proxyUrl} — all Claude Code traffic routes through us`);
-        exports.out.appendLine(`[DASHBOARD] ${dashboardUrl}`);
-        updateStatusBar(0, true);
-        vscode.window.showInformationMessage(`Claude Steward active — proxy on :${proxyConfig.port}, dashboard at ${dashboardUrl}`);
-    }
-    catch (err) {
-        if (err.message?.includes('already in use')) {
-            isAttachedToExistingProxy = true;
-            activateRouting();
-            startGlobalWatch();
-            exports.out.appendLine(`[PROXY] Port ${proxyConfig.port} already in use — attaching to existing proxy`);
-            updateStatusBar(0, true);
-            vscode.window.showInformationMessage(`Claude Steward: Attached to existing proxy on :${proxyConfig.port}`);
-            startHealthCheck();
-        }
-        else {
-            exports.out.appendLine(`[PROXY ERROR] ${err.message}`);
-            vscode.window.showWarningMessage(`Claude Steward: proxy failed to start — ${err.message}.`);
-        }
-    }
+    startHealthCheck();
     // ── Commands ──────────────────────────────────────────────────────────────
     context.subscriptions.push(vscode.commands.registerCommand('claudeOptimizer.showDashboard', () => {
         vscode.env.openExternal(vscode.Uri.parse(dashboardUrl));
-    }), vscode.commands.registerCommand('claudeOptimizer.toggle', () => {
-        if (!proxy?.isRunning() && !isAttachedToExistingProxy) {
-            vscode.window.showWarningMessage('Claude Optimizer: Proxy is not running. Press F5 first.');
-            return;
-        }
-        if (isAttachedToExistingProxy && !proxy?.isRunning()) {
-            vscode.window.showInformationMessage('Claude Optimizer: Routing active via proxy owned by another window.');
-            return;
-        }
-        const nowEnabled = proxy.toggle();
-        const s = stats.getSessionStats();
-        updateStatusBar(s.totalSavedTokens, true, nowEnabled);
-        vscode.window.showInformationMessage(nowEnabled
+    }), vscode.commands.registerCommand('claudeOptimizer.toggle', async () => {
+        const result = await proxyHttp('POST', '/proxy-toggle');
+        proxyEnabled = result?.enabled ?? !proxyEnabled;
+        updateStatusBar(0, true, proxyEnabled);
+        vscode.window.showInformationMessage(proxyEnabled
             ? 'Claude Optimizer: ON — optimizing requests'
             : 'Claude Optimizer: PAUSED — passing through unchanged');
     }), vscode.commands.registerCommand('claudeOptimizer.startProxy', async () => {
-        if (proxy?.isRunning()) {
+        if (await isProxyAlive(proxyPort)) {
             vscode.window.showInformationMessage('Proxy is already running.');
             return;
         }
-        try {
-            await proxy.start();
-            activateRouting();
-            updateStatusBar(stats.getSessionStats().totalSavedTokens, true);
-            vscode.window.showInformationMessage(`Proxy started on port ${proxyConfig.port}.`);
+        spawnWorker(buildWorkerCfg(vscode.workspace.getConfiguration('claudeOptimizer')));
+        const ok = await waitForProxy(proxyPort, 10000);
+        if (ok) {
+            activateRouting(proxyUrl, envColl);
+            updateStatusBar(0, true);
+            vscode.window.showInformationMessage(`Proxy started on port ${proxyPort}.`);
         }
-        catch (e) {
-            vscode.window.showErrorMessage(`Proxy failed: ${e.message}`);
+        else {
+            vscode.window.showErrorMessage('Proxy failed to start.');
         }
     }), vscode.commands.registerCommand('claudeOptimizer.stopProxy', async () => {
-        await proxy?.stop();
-        deactivateRouting();
-        updateStatusBar(stats.getSessionStats().totalSavedTokens, false);
+        await proxyHttp('POST', '/proxy-shutdown');
+        deactivateRouting(envColl);
+        updateStatusBar(0, false);
         vscode.window.showInformationMessage('Proxy stopped.');
     }), vscode.commands.registerCommand('claudeOptimizer.clearCache', () => {
-        cache.clear();
+        proxyHttp('POST', '/proxy-clear');
         vscode.window.showInformationMessage('Cache cleared.');
     }), vscode.commands.registerCommand('claudeOptimizer.clearProxyState', () => {
-        cache.clear();
-        stats.clear();
-        vscode.window.showInformationMessage('Proxy state cleared (cache + stats reset).');
+        proxyHttp('POST', '/proxy-clear');
+        context.workspaceState.update('claudeOptimizer.traces', []);
+        vscode.window.showInformationMessage('Proxy state cleared.');
+    }), vscode.commands.registerCommand('claudeOptimizer.emergencyCleanup', async () => {
+        const pick = await vscode.window.showWarningMessage('Remove ANTHROPIC_BASE_URL from registry and stop the proxy. Run before uninstalling.', 'Run Cleanup', 'Cancel');
+        if (pick !== 'Run Cleanup') {
+            return;
+        }
+        deactivateRouting(envColl);
+        await proxyHttp('POST', '/proxy-shutdown');
+        vscode.window.showInformationMessage('Cleanup done. You can now uninstall safely.');
     }), vscode.commands.registerCommand('claudeOptimizer.optimizeSelection', async () => {
         const editor = vscode.window.activeTextEditor;
         if (!editor || editor.selection.isEmpty) {
             vscode.window.showWarningMessage('Select a prompt to optimize.');
             return;
         }
+        const tc = new tokenCounter_1.TokenCounter();
+        await tc.init();
+        const optimizer = new promptOptimizer_1.PromptOptimizer(tc);
         const selected = editor.document.getText(editor.selection);
         const result = optimizer.optimize({
             model: 'claude-sonnet-4-6',
             messages: [{ role: 'user', content: selected }]
         });
         const savedPct = result.originalTokens > 0
-            ? ((result.savedTokens / result.originalTokens) * 100).toFixed(1)
-            : '0';
-        vscode.window.showInformationMessage(`Optimized: ${result.originalTokens} → ${result.optimizedTokens} tokens (${savedPct}% saved). Techniques: ${result.techniques.join(', ') || 'none'}`);
+            ? ((result.savedTokens / result.originalTokens) * 100).toFixed(1) : '0';
+        vscode.window.showInformationMessage(`Optimized: ${result.originalTokens} → ${result.optimizedTokens} tokens (${savedPct}% saved). ` +
+            `Techniques: ${result.techniques.join(', ') || 'none'}`);
     }));
-    // ── Config change listener ─────────────────────────────────────────────
+    // ── Config change → forward to worker ────────────────────────────────────
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
-        if (!e.affectsConfiguration('claudeOptimizer'))
+        if (!e.affectsConfiguration('claudeOptimizer')) {
             return;
+        }
         const c = vscode.workspace.getConfiguration('claudeOptimizer');
-        proxy?.updateConfig({
+        proxyHttp('POST', '/proxy-config', {
             enableCache: c.get('enableCache'),
             enableCompression: c.get('enablePromptCompression'),
             enableModelRouter: c.get('enableModelRouter'),
             modelRouterMode: c.get('modelRouterMode', 'balanced'),
         });
-        cache.updateThreshold(c.get('cacheThreshold', 0.92));
     }));
-    // Cleanup — VS Code calls dispose() synchronously (no await), so only sync work here.
-    // Async proxy stop is handled in deactivate() which VS Code does await.
+    // ── Dispose ───────────────────────────────────────────────────────────────
+    // On extension host restart: clear timers but do NOT kill worker (it persists).
+    // Worker is only killed via emergencyCleanup / stopProxy commands.
     context.subscriptions.push({
         dispose: () => {
+            if (statsPollingInterval) {
+                clearInterval(statsPollingInterval);
+                statsPollingInterval = null;
+            }
             if (healthCheckInterval) {
                 clearInterval(healthCheckInterval);
                 healthCheckInterval = null;
             }
-            if (globalWatchInterval) {
-                clearInterval(globalWatchInterval);
-                globalWatchInterval = null;
-            }
-            deactivateRouting(); // envColl.delete clears env from all terminals immediately
+            // env vars: keep ANTHROPIC_BASE_URL set — worker is still running.
+            // Only clear on intentional disable (stopProxy / emergencyCleanup).
             logMonitor.dispose();
-            tokenCounter.dispose();
-            stats.dispose();
         }
     });
-    console.log('[Claude Optimizer] Active. Proxy:', proxy.isRunning() ? 'running' : 'stopped');
+    exports.out.appendLine('[Claude Steward] Active.');
 }
 async function deactivate() {
-    // Subscriptions may not be disposed if VS Code kills the host on uninstall — clean up explicitly.
+    // Intentional VS Code shutdown — clear env var so new processes don't try dead proxy.
+    // Worker process itself keeps running until killed by the OS or emergencyCleanup.
     if (process.platform === 'win32') {
         try {
-            (0, child_process_1.execSync)('reg delete HKCU\\Environment /v ANTHROPIC_BASE_URL /f', { stdio: 'ignore' });
+            (0, child_process_2.execSync)(WIN_CLEAR_BASE_URL, { stdio: 'ignore' });
         }
         catch { }
     }
-    await proxy?.stop();
 }
-// ── Helpers ────────────────────────────────────────────────────────────────
-function isProxyAlive(port) {
-    return new Promise((resolve) => {
-        const socket = new net.Socket();
-        const timer = setTimeout(() => { socket.destroy(); resolve(false); }, 2000);
-        socket.connect(port, '127.0.0.1', () => { clearTimeout(timer); socket.destroy(); resolve(true); });
-        socket.on('error', () => { clearTimeout(timer); resolve(false); });
-    });
-}
-function updateStatusBar(savedTokens, proxyRunning, optimizerEnabled = true) {
-    const icon = !proxyRunning ? '$(circle-slash)' : optimizerEnabled ? '$(shield)' : '$(debug-pause)';
-    const saved = savedTokens >= 1000 ? `${(savedTokens / 1000).toFixed(1)}k` : String(savedTokens);
-    const state = !proxyRunning ? 'OFF' : optimizerEnabled ? `${saved} tokens saved` : 'PAUSED';
-    statusBarItem.text = `${icon} Claude Optimizer: ${state}`;
-    statusBarItem.backgroundColor = optimizerEnabled && proxyRunning
-        ? undefined
-        : new vscode.ThemeColor('statusBarItem.warningBackground');
-}
-function setStatusBarLoading() {
-    statusBarItem.text = '$(loading~spin) Claude Optimizer: Starting...';
-    statusBarItem.backgroundColor = undefined;
-}
+// ── Integration registration ──────────────────────────────────────────────────
 function registerIntegrations(builder, config, workspaceRoot) {
-    // Jira
     const jiraUrl = config.get('jira.baseUrl', '');
     if (jiraUrl) {
         builder.registerIntegration('jira', new jiraIntegration_1.JiraIntegration({
@@ -486,7 +459,6 @@ function registerIntegrations(builder, config, workspaceRoot) {
             defaultProject: config.get('jira.defaultProject'),
         }));
     }
-    // Confluence
     const cfUrl = config.get('confluence.baseUrl', '');
     if (cfUrl) {
         builder.registerIntegration('confluence', new confluenceIntegration_1.ConfluenceIntegration({
@@ -496,7 +468,6 @@ function registerIntegrations(builder, config, workspaceRoot) {
             defaultSpace: config.get('confluence.defaultSpace'),
         }));
     }
-    // CI/CD
     const ciProvider = config.get('cicd.provider', '');
     if (ciProvider) {
         builder.registerIntegration('cicd', new cicdIntegration_1.CICDIntegration({
@@ -512,7 +483,6 @@ function registerIntegrations(builder, config, workspaceRoot) {
             jenkinsJob: config.get('cicd.jenkinsJob'),
         }));
     }
-    // Azure
     const azureTenant = config.get('azure.tenantId', '') || process.env.AZURE_TENANT_ID || '';
     if (azureTenant) {
         builder.registerIntegration('azure', new azureIntegration_1.AzureIntegration({
@@ -523,7 +493,6 @@ function registerIntegrations(builder, config, workspaceRoot) {
             defaultResourceGroup: config.get('azure.defaultResourceGroup'),
         }));
     }
-    // Databricks
     const dbHost = config.get('databricks.host', '') || process.env.DATABRICKS_HOST || '';
     if (dbHost) {
         builder.registerIntegration('databricks', new databricksIntegration_1.DatabricksIntegration({
@@ -532,10 +501,9 @@ function registerIntegrations(builder, config, workspaceRoot) {
             defaultClusterId: config.get('databricks.defaultClusterId'),
         }));
     }
-    // Terraform
-    const tfPath = config.get('terraform.workspacePath', workspaceRoot);
-    builder.registerIntegration('terraform', new terraformIntegration_1.TerraformIntegration({ workspacePath: tfPath }));
-    // Database
+    builder.registerIntegration('terraform', new terraformIntegration_1.TerraformIntegration({
+        workspacePath: config.get('terraform.workspacePath', workspaceRoot),
+    }));
     const dbConnStr = config.get('database.connectionString', '') || process.env.DATABASE_URL || '';
     if (dbConnStr) {
         builder.registerIntegration('database', new databaseIntegration_1.DatabaseIntegration({

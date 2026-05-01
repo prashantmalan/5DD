@@ -53,11 +53,13 @@ class DashboardServer {
     constructor(stats, port = 8788, getTraces, proxyPort = 8787) {
         this.server = null;
         this.sseClients = [];
+        this.onClear = null;
         this.stats = stats;
         this.port = port;
         this.proxyPort = proxyPort;
         this.getTraces = getTraces ?? (() => []);
     }
+    setOnClear(cb) { this.onClear = cb; }
     /** Push a real-time event to all SSE listeners */
     pushEvent(type, payload) {
         const msg = `data: ${JSON.stringify({ type, ...payload })}\n\n`;
@@ -94,7 +96,7 @@ class DashboardServer {
                     res.end();
                     return;
                 }
-                if ((url === '/proxy-clear' || url === '/proxy-restart-host') && req.method === 'POST') {
+                if ((url === '/proxy-clear' || url === '/proxy-restart-host' || url === '/proxy-restart') && req.method === 'POST') {
                     this.relayToProxy('POST', url, res);
                     return;
                 }
@@ -110,6 +112,7 @@ class DashboardServer {
                 }
                 if (url === '/clear' && req.method === 'POST') {
                     this.stats.clear();
+                    this.onClear?.();
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: true }));
                     return;
@@ -282,7 +285,7 @@ class DashboardServer {
   <button class="dl" onclick="downloadLogs()">Download logs (CSV)</button>
   <button onclick="clearStats()">Clear stats</button>
   <button class="danger" onclick="clearAll()">Clear all proxy state</button>
-  <button onclick="routeAllWindows()" title="Restarts the VS Code extension host so all existing Claude Code chat windows route through the proxy">Route all windows ↺</button>
+  <button onclick="restartProxy()" title="Restarts the proxy HTTP server without touching VS Code or existing chat windows">Restart proxy ↺</button>
 </div>
 
 <div class="status" id="proxy-status-bar"><span id="proxy-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#8b949e;margin-right:5px"></span><span id="proxy-status-text">Connecting to proxy…</span></div>
@@ -496,11 +499,11 @@ async function downloadLogs() {
 
 async function clearStats() { await fetch(PROXY_ORIGIN + '/proxy-clear', { method:'POST' }); poll(); }
 async function clearAll()   { await fetch(PROXY_ORIGIN + '/proxy-clear', { method:'POST' }); poll(); }
-async function routeAllWindows() {
-  if (!confirm('This restarts the VS Code extension host.\\nAll existing Claude Code chat windows will route through the proxy after restart.\\nIn-progress responses will be interrupted.\\n\\nContinue?')) return;
+async function restartProxy() {
   const txt = document.getElementById('proxy-status-text');
-  if (txt) txt.textContent = 'Restarting extension host…';
-  await fetch(PROXY_ORIGIN + '/proxy-restart-host', { method:'POST' }).catch(() => {});
+  if (txt) txt.textContent = 'Restarting proxy…';
+  await fetch(PROXY_ORIGIN + '/proxy-restart', { method:'POST' }).catch(() => {});
+  setTimeout(poll, 1000);
 }
 
 poll();

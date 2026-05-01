@@ -72,9 +72,10 @@ function simpleHash(str: string): string {
 export class ModelRouter {
   private config: ModelRouterConfig;
   private routingLog: RoutingDecision[] = [];
-  // LRU-style classifier cache: hash(lastMessage) → complexity
-  private classifierCache = new Map<string, 'simple' | 'moderate' | 'complex'>();
+  // Classifier cache: hash(lastMessage) → { complexity, expiresAt }
+  private classifierCache = new Map<string, { complexity: 'simple' | 'moderate' | 'complex'; expiresAt: number }>();
   private static readonly CLASSIFIER_CACHE_MAX = 500;
+  private static readonly CLASSIFIER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   constructor(config: ModelRouterConfig | boolean = true) {
     if (typeof config === 'boolean') {
@@ -127,14 +128,15 @@ export class ModelRouter {
     // Check classifier cache (hash of last user message) — instant
     const cacheKey = simpleHash(lastMessage.slice(0, 500));
     const cached = this.classifierCache.get(cacheKey);
-    if (cached) {
-      const finalModel = this.applyConstraints(this.complexityToModel(cached), originalModel);
+    if (cached && cached.expiresAt > Date.now()) {
+      const finalModel = this.applyConstraints(this.complexityToModel(cached.complexity), originalModel);
       return {
         selectedModel: finalModel,
-        reason: `classifier-cache: ${cached}`,
+        reason: `classifier-cache: ${cached.complexity}`,
         downgraded: this.modelRank(finalModel) < this.modelRank(originalModel),
       };
     }
+    if (cached) { this.classifierCache.delete(cacheKey); } // expired
 
     // No cache hit — fire classification in the background (zero latency for this request).
     // The result will be cached and applied to the NEXT identical/similar message.
@@ -153,7 +155,10 @@ export class ModelRouter {
         if (this.classifierCache.size >= ModelRouter.CLASSIFIER_CACHE_MAX) {
           this.classifierCache.delete(this.classifierCache.keys().next().value!);
         }
-        this.classifierCache.set(cacheKey, complexity);
+        this.classifierCache.set(cacheKey, {
+          complexity,
+          expiresAt: Date.now() + ModelRouter.CLASSIFIER_CACHE_TTL,
+        });
       })
       .catch(() => { /* silent — classification is best-effort */ });
   }

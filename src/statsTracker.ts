@@ -4,45 +4,10 @@
  */
 
 import * as vscode from 'vscode';
+import { RequestStat, SessionStats, IStatsTracker } from './types';
+export { RequestStat, SessionStats, IStatsTracker };
 
-export interface RequestStat {
-  timestamp: number;
-  model: string;
-  originalModel: string;
-  inputTokens: number;        // new tokens billed at full input price
-  outputTokens: number;
-  cacheReadTokens: number;    // Anthropic's prompt cache reads (billed at ~10%)
-  cacheCreationTokens: number; // Anthropic's prompt cache writes (billed at ~125%)
-  savedTokensByCompression: number;
-  savedTokensByCache: number;
-  cacheHit: boolean;
-  modelDowngraded: boolean;
-  costUSD: number;
-  savedCostUSD: number;
-  savedCostByCompression: number;  // portion from token trimming
-  savedCostByRouting: number;      // portion from cheaper model routing
-  techniques: string[];
-}
-
-export interface SessionStats {
-  totalRequests: number;
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCacheReadTokens: number;
-  totalCacheCreationTokens: number;
-  totalSavedTokens: number;
-  totalOriginalTokens: number;     // what would have been sent without our compression
-  totalCostUSD: number;
-  totalSavedCostUSD: number;
-  totalSavedCostByCompression: number;
-  totalSavedCostByRouting: number;
-  cacheHits: number;
-  modelDowngrades: number;
-  avgSavingsPct: number;
-  requests: RequestStat[];
-}
-
-export class StatsTracker {
+export class StatsTracker implements IStatsTracker {
   private stats: RequestStat[] = [];
   private context: vscode.ExtensionContext;
   private _onUpdate = new vscode.EventEmitter<SessionStats>();

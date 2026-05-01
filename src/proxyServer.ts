@@ -19,7 +19,7 @@ import { SemanticCache } from './semanticCache';
 import { PromptOptimizer } from './promptOptimizer';
 import { ModelRouter } from './modelRouter';
 import { TokenCounter, AnthropicRequestBody } from './tokenCounter';
-import { StatsTracker, RequestStat } from './statsTracker';
+import { IStatsTracker, RequestStat } from './statsTracker';
 import { PiiFilter } from './piiFilter';
 import { ContextCompactor } from './contextCompactor';
 
@@ -65,7 +65,7 @@ export class ProxyServer {
   private optimizer: PromptOptimizer;
   private router: ModelRouter;
   private tokenCounter: TokenCounter;
-  private stats: StatsTracker;
+  private stats: IStatsTracker;
   private piiFilter: PiiFilter;
   private config: ProxyConfig;
   private log: (msg: string) => void;
@@ -77,6 +77,8 @@ export class ProxyServer {
   private onTrace?: (trace: MessageTrace) => void;
   private onPiiDetected?: (types: string[]) => void;
   private onRestartHost?: () => void;
+  private onRestart?: () => void;
+  private onShutdown?: () => void;
 
   getTraces(n = 50): MessageTrace[] {
     return this.traces.slice(-n).reverse();
@@ -93,6 +95,8 @@ export class ProxyServer {
   setOnTrace(cb: (trace: MessageTrace) => void): void { this.onTrace = cb; }
   setOnPiiDetected(cb: (types: string[]) => void): void { this.onPiiDetected = cb; }
   setOnRestartHost(cb: () => void): void { this.onRestartHost = cb; }
+  setOnRestart(cb: () => void): void { this.onRestart = cb; }
+  setOnShutdown(cb: () => void): void { this.onShutdown = cb; }
 
   constructor(
     config: ProxyConfig,
@@ -100,7 +104,7 @@ export class ProxyServer {
     optimizer: PromptOptimizer,
     router: ModelRouter,
     tokenCounter: TokenCounter,
-    stats: StatsTracker,
+    stats: IStatsTracker,
     log?: (msg: string) => void
   ) {
     this.config = config;
@@ -219,6 +223,46 @@ export class ProxyServer {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: true }));
       setTimeout(() => this.onRestartHost?.(), 300);
+      return;
+    }
+    if (req.url === '/proxy-restart' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true }));
+      setTimeout(() => this.onRestart?.(), 300);
+      return;
+    }
+    if (req.url === '/proxy-shutdown' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true }));
+      setTimeout(() => this.onShutdown?.(), 300);
+      return;
+    }
+    if (req.url === '/proxy-toggle' && req.method === 'POST') {
+      this.config.enabled = !this.config.enabled;
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ enabled: this.config.enabled }));
+      return;
+    }
+    if (req.url === '/proxy-load-traces' && req.method === 'POST') {
+      const body = await readBody(req);
+      try {
+        const traces = JSON.parse(body);
+        if (Array.isArray(traces) && this.traces.length === 0) {
+          this.loadTraces(traces as MessageTrace[]);
+        }
+      } catch {}
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (req.url === '/proxy-config' && req.method === 'POST') {
+      const body = await readBody(req);
+      try {
+        const partial = JSON.parse(body);
+        this.updateConfig(partial);
+      } catch {}
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
 
@@ -462,33 +506,23 @@ export class ProxyServer {
    */
   private async forwardWithFallback(req: http.IncomingMessage, body: AnthropicRequestBody): Promise<any> {
     const MODEL_ESCALATION = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-6'];
-    let currentBody = body;
+    const response = await this.forwardToAnthropic(req, body);
+    if (!response?.error) { return response; }
 
-    while (true) {
-      const response = await this.forwardToAnthropic(req, currentBody);
+    // One escalation attempt only — avoids burning Opus tokens on sustained errors.
+    const currentIdx = MODEL_ESCALATION.indexOf(body.model);
+    if (currentIdx === -1 || currentIdx >= MODEL_ESCALATION.length - 1) { return response; }
 
-      // Success — return as-is
-      if (!response?.error) return response;
-
-      // On 400 errors, try escalating to the next model
-      const currentIdx = MODEL_ESCALATION.indexOf(currentBody.model);
-      if (currentIdx !== -1 && currentIdx < MODEL_ESCALATION.length - 1) {
-        const nextModel = MODEL_ESCALATION[currentIdx + 1];
-        this.log(`WARN: ${currentBody.model} rejected (${response.error.message?.slice(0, 60)}), escalating → ${nextModel}`);
-        currentBody = { ...currentBody, model: nextModel };
-        // If thinking isn't enabled, strip all extended-thinking / context fields on escalation
-        if (!currentBody.thinking || (currentBody.thinking.type !== 'enabled' && currentBody.thinking.type !== 'adaptive')) {
-          delete currentBody.strategy;
-          delete currentBody.thinking;
-          delete currentBody.context_management;
-          delete currentBody.output_config;
-        }
-        continue;
-      }
-
-      // No escalation possible — return the error response
-      return response;
+    const nextModel = MODEL_ESCALATION[currentIdx + 1];
+    this.log(`WARN: ${body.model} rejected (${response.error.message?.slice(0, 60)}), escalating → ${nextModel}`);
+    const escalated: any = { ...body, model: nextModel };
+    if (!escalated.thinking || (escalated.thinking.type !== 'enabled' && escalated.thinking.type !== 'adaptive')) {
+      delete escalated.strategy;
+      delete escalated.thinking;
+      delete escalated.context_management;
+      delete escalated.output_config;
     }
+    return this.forwardToAnthropic(req, escalated as AnthropicRequestBody);
   }
 
   // Pipe a streaming response — buffers status before committing to client so we can escalate on 400
@@ -500,7 +534,7 @@ export class ProxyServer {
   ): void {
     const MODEL_ESCALATION = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-6'];
 
-    const attempt = (currentBody: AnthropicRequestBody): void => {
+    const attempt = (currentBody: AnthropicRequestBody, depth = 0): void => {
       this.sanitizeThinkingFields(currentBody, req);
       const bodyStr = JSON.stringify(currentBody);
       const headers = this.buildForwardHeaders(req, bodyStr, currentBody.model, currentBody);
@@ -520,7 +554,7 @@ export class ProxyServer {
             let parsed: any = {};
             try { parsed = JSON.parse(errData); } catch {}
             const currentIdx = MODEL_ESCALATION.indexOf(currentBody.model);
-            if (currentIdx !== -1 && currentIdx < MODEL_ESCALATION.length - 1) {
+            if (depth === 0 && currentIdx !== -1 && currentIdx < MODEL_ESCALATION.length - 1) {
               const nextModel = MODEL_ESCALATION[currentIdx + 1];
               this.log(`WARN: Streaming: ${currentBody.model} rejected (${parsed?.error?.message?.slice(0, 60)}), escalating → ${nextModel}`);
               const escalated: AnthropicRequestBody = { ...currentBody, model: nextModel };
@@ -530,7 +564,7 @@ export class ProxyServer {
                 delete escalated.context_management;
                 delete escalated.output_config;
               }
-              attempt(escalated);
+              attempt(escalated, 1);
             } else {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(errData);
