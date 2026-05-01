@@ -49,6 +49,35 @@ const MODEL_COSTS: Record<string, { input: number; output: number }> = {
 
 const MODEL_HIERARCHY = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-6'];
 
+// Context window (max input tokens) per model — Haiku and Sonnet cap at 200K;
+// Opus 4+ supports up to 1M with extended-context access.
+const MODEL_CONTEXT_WINDOW: Record<string, number> = {
+  'claude-haiku-4-5-20251001': 200_000,
+  'claude-haiku-4-5':          200_000,
+  'claude-haiku-3-5':          200_000,
+  'claude-sonnet-4-6':         200_000,
+  'claude-sonnet-4-5':         200_000,
+  'claude-opus-4-6':         1_000_000,
+  'claude-opus-4-7':         1_000_000,
+  'claude-opus-4-5':           200_000,
+};
+
+// Rough token estimate: 4 characters ≈ 1 token
+function estimateTokens(body: AnthropicRequestBody): number {
+  let chars = 0;
+  if (body.system) {
+    chars += typeof body.system === 'string'
+      ? body.system.length
+      : JSON.stringify(body.system).length;
+  }
+  for (const msg of body.messages ?? []) {
+    chars += typeof msg.content === 'string'
+      ? msg.content.length
+      : JSON.stringify(msg.content).length;
+  }
+  return Math.ceil(chars / 4);
+}
+
 const CLASSIFIER_PROMPT = `Classify the complexity of this user request. Reply with ONLY one word:
 
 simple   = greeting, thanks, trivial yes/no, one-liner, explain/describe/summarize existing code, read-only questions about code, bash/git/log output interpretation
@@ -103,6 +132,7 @@ export class ModelRouter {
   private async decide(body: AnthropicRequestBody, requestApiKey?: string): Promise<Omit<RoutingDecision, 'originalModel'>> {
     const originalModel = body.model;
     const lastMessage = this.extractLastUserMessage(body);
+    const inputTokens = estimateTokens(body);
 
     // Conservative mode: never downgrade — honour the requested model exactly
     if ((this.config.mode ?? 'balanced') === 'conservative') {
@@ -117,7 +147,7 @@ export class ModelRouter {
     // Pre-classify locally — instant, no API call
     const preClass = this.preClassify(body, lastMessage);
     if (preClass) {
-      const finalModel = this.applyConstraints(this.complexityToModel(preClass), originalModel);
+      const finalModel = this.applyConstraints(this.complexityToModel(preClass), originalModel, inputTokens);
       return {
         selectedModel: finalModel,
         reason: `pre-classified: ${preClass}`,
@@ -129,7 +159,7 @@ export class ModelRouter {
     const cacheKey = simpleHash(lastMessage.slice(0, 500));
     const cached = this.classifierCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
-      const finalModel = this.applyConstraints(this.complexityToModel(cached.complexity), originalModel);
+      const finalModel = this.applyConstraints(this.complexityToModel(cached.complexity), originalModel, inputTokens);
       return {
         selectedModel: finalModel,
         reason: `classifier-cache: ${cached.complexity}`,
@@ -244,7 +274,20 @@ export class ModelRouter {
     }
   }
 
-  private applyConstraints(targetModel: string, _originalModel: string): string {
+  private applyConstraints(targetModel: string, originalModel: string, inputTokens = 0): string {
+    // Never route to a model whose context window is smaller than the request
+    const targetWindow = MODEL_CONTEXT_WINDOW[targetModel] ?? 200_000;
+    if (inputTokens > targetWindow) {
+      // Escalate through the hierarchy until we find a model that fits
+      const escalated = MODEL_HIERARCHY.find(m => (MODEL_CONTEXT_WINDOW[m] ?? 200_000) >= inputTokens);
+      if (escalated && this.modelRank(escalated) > this.modelRank(targetModel)) {
+        targetModel = escalated;
+      } else {
+        // Nothing in hierarchy fits — keep original model
+        return originalModel;
+      }
+    }
+
     // Enforce minimum model floor if set
     if (this.config.minimumModel) {
       if (this.modelRank(this.config.minimumModel) > this.modelRank(targetModel)) {
